@@ -177,7 +177,18 @@ def parse(data: bytes) -> Update:
             exps.add(g.exponent)
             groups.append(g)
             total_blocks += n_blocks(g.count)
+        if sum(g.count for g in groups) > numel:
+            raise CorruptUpdate("more changes than elements")
         tensors.append(TensorHeader(name, numel, chk, groups))
+
+    # every table is used, and has no more symbols than changes with its exponent
+    per_exp = {}
+    for t in tensors:
+        for g in t.groups:
+            per_exp[g.exponent] = per_exp.get(g.exponent, 0) + g.count
+    for tb in tables:
+        if len(tb.symbols) > per_exp.get(tb.exponent, 0):
+            raise CorruptUpdate("table unused or larger than its changes")
 
     if 4 * total_blocks > r.remaining():
         raise CorruptUpdate("block table longer than the update")
@@ -185,6 +196,17 @@ def parse(data: bytes) -> Update:
     payload = r.take(r.varint())
     if r.remaining():
         raise CorruptUpdate("trailing bytes after the payload")
-    if sum(block_bits) > 8 * len(payload):
-        raise CorruptUpdate("payload shorter than its block table")
+    total_bits = sum(block_bits)
+    if (total_bits + 7) // 8 != len(payload):
+        raise CorruptUpdate("payload length does not match its block table")
+    if total_bits % 8 and payload[-1] & ((1 << (8 - total_bits % 8)) - 1):
+        raise CorruptUpdate("non-zero padding bits")
+    # each change costs at least 2 + rice_r bits, so declared changes are bounded by the payload
+    b = 0
+    for t in tensors:
+        for g in t.groups:
+            for k in range(n_blocks(g.count)):
+                if block_bits[b] < min(BLOCK, g.count - k * BLOCK) * (2 + g.rice_r):
+                    raise CorruptUpdate("block shorter than its symbols could be")
+                b += 1
     return Update(tables, tensors, block_bits, payload)

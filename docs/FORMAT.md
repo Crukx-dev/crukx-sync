@@ -4,7 +4,7 @@ An update turns one set of bf16 weights (`old`) into the next (`new`) exactly. I
 RL weight sync: between consecutive broadcasts only ~0.5–3% of bf16 weights change, and most
 changes are one unit in the last place. Evidence: `crukx-research/studies/2026-10-14-r1-rl-step-deltas`.
 
-All integers are little-endian. `varint` is unsigned LEB128. `zigzag(v) = (v << 1) ^ (v >> 31)`.
+All integers are little-endian. `varint` is unsigned LEB128. `zigzag(v) = 2v` for `v ≥ 0`, `-2v - 1` for `v < 0`.
 
 ```
 update   := "CRXS" version:u8(=2) n_tables:varint table* n_tensors:varint tensor*
@@ -50,8 +50,10 @@ zero-padded to a byte.
   tensor and each with a table
 - `1 ≤ count ≤` the number of elements with that old exponent
 - `0 ≤ rice_r ≤ 30`; every gap smaller than its group
-- `1 ≤ n_sym ≤ count`, symbols unique and ≤ 131070, code lengths 1–17, Kraft sum ≤ 1
-- varints < 2^63; block lengths sum to at most the payload's bits and every block decodes
+- every table used by some group; `1 ≤ n_sym ≤` total changes with that exponent; symbols unique
+  and ≤ 131070, code lengths 1–17, Kraft sum ≤ 1
+- per tensor, total changes ≤ `numel`; every block at least `changes × (2 + rice_r)` bits
+- varints < 2^63; `payload_len = ceil(sum(block_bits) / 8)`, padding bits zero; every block decodes
   exactly to its length
 
 ## Integrity

@@ -1,19 +1,13 @@
-"""Benchmark crukx-sync on real GRPO updates (Qwen2.5-1.5B-Instruct, bf16 broadcast per step).
+"""Benchmark crukx-sync on real GRPO updates (bf16 broadcast per step).
 
-Usage: python bench/grpo.py LR STEPS OUT   (needs torch + transformers + a CUDA GPU)
-Each step: encode_update(prev, cur) on the trainer, apply_update on a copy (the receiver),
-check the copy equals cur bit-for-bit, and record bytes and times.
+Usage: [CRUKX_BENCH_MODEL=...] python bench/grpo.py LR STEPS OUT   (torch + transformers + a CUDA GPU)
 
-Training setup, from crukx-research R1g:
-
-Policy (bf16) on the GPU samples answers to arithmetic prompts; reward = exact answer.
-GRPO loss: group-normalised advantage x mean token log-prob of each completion
-(no KL term, no clipping: one update per batch). Gradients go to fp32 master weights
-with AdamW on the CPU (the 3090 cannot hold fp32 master + Adam for 1.5B); the bf16 cast
-of the master weights is written back to the GPU policy: that cast is the broadcast.
-
-Per step, vs the previous broadcast: changed fraction, the old-exponent-context entropy
-bound (R1e) and the concrete Rice+Huffman format size (R1f).
+Policy (bf16) on the GPU samples answers to 2-3 digit additions; reward = exact answer.
+GRPO loss: group-normalised advantage x mean token log-prob of each completion (no KL, no
+clipping, one update per batch). Gradients go to fp32 master weights with AdamW on the CPU (a
+24 GB GPU cannot hold fp32 master + Adam for 1.5B); the bf16 cast written back to the GPU policy
+is the broadcast. Each step: encode_update(prev, cur) on the trainer, apply_update on the
+receiver's own tensors (kept across steps, with checksum caches), then a bit-for-bit check.
 """
 import json, os, random, re, sys, time
 import torch
@@ -21,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from crukx_sync import apply_update, encode_update
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL = os.path.expanduser("~/crukx-experiments/20261009-xet/models/Qwen2.5-1.5B-Instruct")
+MODEL = os.environ.get("CRUKX_BENCH_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")  # HF id or local path
 LR = float(sys.argv[1]); STEPS = int(sys.argv[2]); OUT = sys.argv[3]
 PROMPTS, GROUP, MAX_NEW = 8, 8, 12
 random.seed(0); torch.manual_seed(0); os.makedirs(OUT, exist_ok=True)
@@ -89,7 +83,7 @@ for step in range(1, STEPS + 1):
     row = {"step": step, "reward": round(r.mean().item(), 3), "loss": round(loss.item(), 4),
            "step_s": round(time.time() - t0, 1)}
     torch.cuda.synchronize(); t1 = time.time(); upd = encode_update(prev, cur, send_chk); torch.cuda.synchronize(); enc_s = time.time() - t1
-    recv = prev  # the receiver holds the previous broadcast; apply in place
+    recv = prev  # the receiver's own tensors, updated in place every step
     t1 = time.time(); stats = apply_update(recv, upd, recv_chk); torch.cuda.synchronize(); dec_s = time.time() - t1
     exact = all(torch.equal(recv[k].view(torch.int16), cur[k].view(torch.int16)) for k in cur)
     full = 2 * total
@@ -100,5 +94,6 @@ for step in range(1, STEPS + 1):
                 "encode_s": round(enc_s, 3), "apply_s": round(dec_s, 3), "exact": exact})
     assert exact, "receiver does not match the trainer"
     rows.append(row); print(json.dumps(row), flush=True)
-    prev = cur
+    # `prev` (the receiver's tensors) now equals `cur`; keep the same tensors, as a real worker does
+    del cur
 json.dump({"lr": LR, "params": total, "rows": rows}, open(os.path.join(OUT, "stats.json"), "w"), indent=1)

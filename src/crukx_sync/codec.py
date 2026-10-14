@@ -173,17 +173,20 @@ def _new_checksum(name, a, b, idx, checksums) -> int:
 
 
 def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
-           checksums: dict[str, int] | None = None) -> Update:
+           checksums: dict[str, int] | None = None) -> tuple[Update, dict[str, int]]:
+    """The update, and the new checksums for the caller to commit once the update is serialized."""
     headers, E, G, Z, group_counts = [], [], [], [], []
-    new_checksums = {}  # committed to `checksums` only if the whole encode succeeds
+    new_checksums = {}
     pairs = {}
     for name in old:
         a, b = bits16(name, old[name]), bits16(name, new[name])
-        if a.shape != b.shape or a.device != b.device:
-            raise ValueError(f"{name}: old and new differ in shape or device")
+        if a.shape != b.shape:
+            raise ValueError(f"{name}: old and new differ in shape")
         pairs[name] = (a, b)
     if not pairs:
-        return Update([], [])
+        return Update([], []), {}
+    if len({t.device for ab in pairs.values() for t in ab}) != 1:
+        raise ValueError("all tensors must be on one device")
     changed_any = torch.stack([(a != b).any() for a, b in pairs.values()]).tolist()  # one sync
     for (name, (a, b)), any_change in zip(pairs.items(), changed_any):
         if not any_change:
@@ -204,9 +207,7 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
         Z.append((res << 1) ^ (res >> 63))
         group_counts += counts.tolist()
     if not headers:
-        return Update([], [])
-    if checksums is not None:
-        checksums.update(new_checksums)
+        return Update([], []), {}
     E, G, Z = torch.cat(E), torch.cat(G), torch.cat(Z)
     dev, n = E.device, E.numel()
     counts = torch.tensor(group_counts, dtype=torch.long, device=dev)
@@ -254,6 +255,8 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
     blocks_per_group = (counts + BLOCK - 1) // BLOCK
     bid = _exclusive_cumsum(blocks_per_group)[gid] + k_in_group // BLOCK
     block_bits = torch.zeros(int(blocks_per_group.sum()), dtype=torch.long, device=dev).scatter_add_(0, bid, L)
+    if int(block_bits.max()) >= 1 << 32:
+        raise ValueError("a block exceeds 2^32 bits; the update cannot be represented")
 
     # set bits: unary ones, Rice remainder (MSB first), Huffman code (MSB first)
     ones = [torch.repeat_interleave(start, q)
@@ -276,7 +279,7 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
         for g in h.groups:
             g.rice_r = rice_list[gi]
             gi += 1
-    return Update(tables, headers, block_bits.tolist(), payload)
+    return Update(tables, headers, block_bits.tolist(), payload), new_checksums
 
 
 # ---------------------------------------------------------------- decoder
@@ -290,7 +293,36 @@ def _read_bits(buf: torch.Tensor, pos: torch.Tensor, n: torch.Tensor) -> torch.T
     return (win >> (40 - (pos & 7) - n)) & ((torch.ones_like(n) << n) - 1)
 
 
-def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict[str, int] | None = None) -> int:
+def _canonical_tables(tables, dev):
+    """Per table and code length: first canonical code, number of codes, index of the first symbol
+    of that length; plus all symbols in (length, table position) order. A few hundred bytes per
+    table regardless of what the update claims, unlike a 2^max_length lookup table."""
+    n = len(tables)
+    first = torch.zeros(n, MAX_CODE_LEN + 1, dtype=torch.long)
+    count = torch.zeros(n, MAX_CODE_LEN + 1, dtype=torch.long)
+    base = torch.zeros(n, MAX_CODE_LEN + 1, dtype=torch.long)
+    syms = []
+    for ti, t in enumerate(tables):
+        order = sorted(range(len(t.lengths)), key=lambda i: (t.lengths[i], i))
+        per_len = [0] * (MAX_CODE_LEN + 1)
+        for L in t.lengths:
+            per_len[L] += 1
+        code, idx = 0, len(syms)
+        for L in range(1, MAX_CODE_LEN + 1):
+            first[ti, L], count[ti, L], base[ti, L] = code, per_len[L], idx
+            code = (code + per_len[L]) << 1
+            idx += per_len[L]
+        syms += [t.symbols[i] for i in order]
+    return first.to(dev), count.to(dev), base.to(dev), torch.tensor(syms, dtype=torch.long, device=dev)
+
+
+def _cache_get(checksums, name, t):
+    """A cached checksum, trusted only if the tensor was not modified since we recorded it."""
+    hit = checksums.get(name) if checksums is not None else None
+    return hit[0] if isinstance(hit, tuple) and hit[1] == t._version else None
+
+
+def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict | None = None) -> int:
     """Verify `u` against `weights`, then write the new values in place. Returns elements changed."""
     if not u.tensors:
         return 0
@@ -306,7 +338,7 @@ def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict[str, i
     if any(a.device != dev for a in targets):
         raise ValueError("all updated tensors must be on one device")
 
-    # per group / per block tables (small, built on CPU)
+    # per group / per block tables (sizes bounded by the update's length, checked in parse)
     table_of = {t.exponent: i for i, t in enumerate(u.tables)}
     g_count, g_rice, g_table, g_size = [], [], [], []
     # exact group sizes need a pass over the tensor; single-slab tensors get them later from the
@@ -322,94 +354,93 @@ def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict[str, i
             g_table.append(table_of[g.exponent])
             g_size.append(sizes[g.exponent])
     counts = torch.tensor(g_count, dtype=torch.long, device=dev)
-    rice_g = torch.tensor(g_rice, dtype=torch.long, device=dev)
-    size_g = torch.tensor(g_size, dtype=torch.long, device=dev)
     nb_g = (counts + BLOCK - 1) // BLOCK
-    if int(nb_g.sum()) != len(u.block_bits):
-        raise CorruptUpdate("block table does not match group counts")
     blk_group = torch.repeat_interleave(torch.arange(len(g_count), device=dev), nb_g)
     blk_k = torch.arange(len(u.block_bits), device=dev) - _exclusive_cumsum(nb_g)[blk_group]
     blk_count = torch.clamp(counts[blk_group] - blk_k * BLOCK, max=BLOCK)
     elem_base = _exclusive_cumsum(counts)[blk_group] + blk_k * BLOCK
-    rice = rice_g[blk_group]
-    q_max = size_g[blk_group] >> rice
+    rice = torch.tensor(g_rice, dtype=torch.long, device=dev)[blk_group]
+    q_max = torch.tensor(g_size, dtype=torch.long, device=dev)[blk_group] >> rice
     tbl = torch.tensor(g_table, dtype=torch.long, device=dev)[blk_group]
     bb = torch.tensor(u.block_bits, dtype=torch.long, device=dev)
     cur = _exclusive_cumsum(bb)
     blk_end = cur + bb
-
-    lmax = max(max(t.lengths) for t in u.tables)
-    lut_sym = torch.zeros(len(u.tables), 1 << lmax, dtype=torch.long)
-    lut_len = torch.zeros(len(u.tables), 1 << lmax, dtype=torch.long)
-    for ti, t in enumerate(u.tables):
-        for s, c, L in zip(t.symbols, canonical_codes(t.lengths), t.lengths):
-            lut_sym[ti, c << (lmax - L):(c + 1) << (lmax - L)] = s
-            lut_len[ti, c << (lmax - L):(c + 1) << (lmax - L)] = L
-    lut_sym, lut_len = lut_sym.to(dev), lut_len.to(dev)
+    first, ncode, base, syms = _canonical_tables(u.tables, dev)
+    lens = torch.arange(1, MAX_CODE_LEN + 1, device=dev)
 
     buf = torch.frombuffer(bytearray(u.payload + bytes(16)), dtype=torch.uint8).to(dev)
-    bits = ((buf.unsqueeze(1) >> torch.arange(7, -1, -1, device=dev)) & 1).flatten()
-    zeros = torch.nonzero(bits == 0).flatten()
+    bits = (buf.unsqueeze(1) >> torch.arange(7, -1, -1, dtype=torch.uint8, device=dev)) & 1
+    idx_t = torch.int32 if bits.numel() < 1 << 31 else torch.long
+    zeros = torch.nonzero(bits.flatten() == 0).flatten().to(idx_t)
+    del bits
     total = int(counts.sum())
     gaps = torch.zeros(total + 1, dtype=torch.long, device=dev)  # last slot absorbs inactive writes
     zz = torch.zeros(total + 1, dtype=torch.long, device=dev)
-    lmax_t = torch.full_like(cur, lmax)
+    peek_n = torch.full_like(cur, MAX_CODE_LEN)
     bad = torch.zeros((), dtype=torch.bool, device=dev)
     for step in range(BLOCK):
         active = step < blk_count
         bad |= (active & (cur >= blk_end)).any()
-        k = torch.searchsorted(zeros, cur)
+        k = torch.searchsorted(zeros, cur.to(idx_t))
         bad |= (active & (k >= zeros.numel())).any()
-        nxt = zeros[k.clamp(max=zeros.numel() - 1)]
+        nxt = zeros[k.clamp(max=zeros.numel() - 1)].long()
         q = nxt - cur
         bad |= (active & (q > q_max)).any()
         c = nxt + 1
         rem = _read_bits(buf, c, rice)
         c = c + rice
-        peek = _read_bits(buf, c, lmax_t)
-        L = lut_len[tbl, peek]
-        bad |= (active & (L == 0)).any()
+        # canonical decode: the shortest length whose code range contains the prefix
+        codes = _read_bits(buf, c, peek_n).unsqueeze(1) >> (MAX_CODE_LEN - lens)
+        fc, nc = first[tbl, 1:], ncode[tbl, 1:]
+        ok = (codes >= fc) & (codes < fc + nc)
+        bad |= (active & ~ok.any(1)).any()
+        L = ok.int().argmax(1) + 1
+        code = codes.gather(1, (L - 1).unsqueeze(1)).squeeze(1)
+        sym_i = base[tbl, L] + code - first[tbl, L]
         out = torch.where(active, elem_base + step, total)
         gaps[out] = (q.clamp(0, 1 << 32) << rice) | rem
-        zz[out] = lut_sym[tbl, peek]
+        zz[out] = syms[sym_i.clamp(0, syms.numel() - 1)]
         cur = torch.where(active, c + L, cur)
     bad |= (cur != blk_end).any()
-    gaps, zz = gaps[:total], zz[:total]
 
-    elem_group = torch.repeat_interleave(torch.arange(len(g_count), device=dev), counts)
-    bad |= (gaps >= size_g[elem_group]).any()
-    cs = torch.cumsum(gaps.clamp(max=1 << 40) + 1, 0)
-    local = cs - 1 - (cs - (gaps + 1))[_exclusive_cumsum(counts)][elem_group]
-    bad |= (local >= size_g[elem_group]).any()
-    if bool(bad):
-        raise CorruptUpdate("payload does not decode to the declared changes")
-
-    # positions and new values per tensor; verify every checksum before writing anything
-    staged, lo, gi = [], 0, 0
+    # per tensor: positions, new values, checksum delta. Validation flags and checksums are
+    # gathered as tensors and checked once at the end; nothing is written until all pass.
+    staged, lo, gi, deltas, expected = [], 0, 0, [], []
     for h, a, hist in zip(u.tensors, targets, hists):
-        n_t = sum(g.count for g in h.groups)
-        sl = slice(lo, lo + n_t)
-        ex = torch.repeat_interleave(torch.tensor([g.exponent for g in h.groups], device=dev),
-                                     counts[gi:gi + len(h.groups)])
+        n_t = sum(x.count for x in h.groups)
+        g_cnt = counts[gi:gi + len(h.groups)]
+        g = gaps[lo:lo + n_t]
+        ex = torch.repeat_interleave(torch.tensor([x.exponent for x in h.groups], device=dev), g_cnt)
+        grp = torch.repeat_interleave(torch.arange(len(h.groups), device=dev), g_cnt)
         if hist is None:
             _, order, starts = _sorted_slab(a, 0)
-            if bool((local[sl] >= (starts[1:] - starts[:-1])[ex]).any()):
-                raise CorruptUpdate(f"{h.name}: position outside its exponent group")
-            idx = order[starts[ex] + local[sl]]
+            size = (starts[1:] - starts[:-1])[ex]
         else:
-            idx = _positions(a, ex, local[sl], hist)
+            size = hist.sum(0)[ex]
+        bad |= (g >= size).any()
+        cs = torch.cumsum(g.clamp(max=1 << 40) + 1, 0)
+        local = cs - 1 - (cs - (g.clamp(max=1 << 40) + 1))[_exclusive_cumsum(g_cnt)][grp]
+        bad |= (local >= size).any()
+        local = torch.minimum(local, size - 1)  # keep gathers in range; `bad` already flags it
+        idx = order[starts[ex] + local] if hist is None else _positions(a, ex, local, hist)
         old_u = a[idx].long() & 0xFFFF
-        z = zz[sl]
+        z = zz[lo:lo + n_t]
         new_u = (old_u + ((z >> 1) ^ -(z & 1))) & 0xFFFF
-        old_chk = checksums[h.name] if checksums is not None and h.name in checksums else checksum(a)
-        chk = (old_chk + int(((new_u - old_u) * _weights(idx)).sum())) & _MASK64
-        if chk != h.checksum:
-            raise CorruptUpdate(f"{h.name}: checksum mismatch after applying the update")
+        old_chk = _cache_get(checksums, h.name, weights[h.name])
+        if old_chk is None:
+            old_chk = checksum(a)
+        deltas.append(((new_u - old_u) * _weights(idx)).sum() + _i64(old_chk))
+        expected.append(_i64(h.checksum))
         staged.append((a, idx, (new_u - ((new_u >> 15) << 16)).to(torch.int16)))
         lo += n_t
         gi += len(h.groups)
+    ok = torch.stack(deltas) == torch.tensor(expected, dtype=torch.long, device=dev)
+    if bool(bad) or not bool(ok.all()):  # one sync for the whole update
+        names = [h.name for h, good in zip(u.tensors, ok.tolist()) if not good]
+        raise CorruptUpdate(f"update does not verify (checksum mismatch: {names[:3]})" if names
+                            else "payload positions outside their exponent groups")
     for a, idx, vals in staged:
         a[idx] = vals
-    if checksums is not None:
-        checksums.update({h.name: h.checksum for h in u.tensors})
+    if checksums is not None:  # record the version after our own write
+        checksums.update({h.name: (h.checksum, weights[h.name]._version) for h in u.tensors})
     return total

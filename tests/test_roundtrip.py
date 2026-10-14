@@ -89,8 +89,9 @@ def test_apply_writes_through_to_views():
     assert torch.equal(view.view(torch.int16), b.view(torch.int16))
 
 
-def test_every_single_byte_flip_is_rejected_cleanly():
-    a, b = rl_like_pair(3000, seed=6)
+@pytest.mark.parametrize("dev", DEVICES)
+def test_every_single_byte_flip_is_rejected_cleanly(dev):
+    a, b = rl_like_pair(3000, seed=6, device=dev)
     upd = encode_update({"w": a}, {"w": b})
     for i in range(len(upd)):
         for x in (0x01, 0x80, 0xFF):
@@ -160,13 +161,94 @@ def test_checksum_cache_over_many_steps(dev):
         apply_update(recv, encode_update(prev, cur, sender), receiver)
         assert torch.equal(recv["w"].view(torch.int16), cur["w"].view(torch.int16))
         prev = cur
-    assert sender == receiver
+    assert sender == {k: v[0] for k, v in receiver.items()}
 
 
-def test_stale_receiver_cache_is_rejected_not_silently_wrong():
+def test_wrong_receiver_cache_is_rejected_not_silently_wrong():
     a, b = rl_like_pair(20_000, seed=8)
     upd = encode_update({"w": a}, {"w": b})
     old = {"w": a.clone()}
     with pytest.raises(CorruptUpdate):
-        apply_update(old, upd, {"w": 12345})
+        apply_update(old, upd, {"w": (12345, old["w"]._version)})
     assert torch.equal(old["w"].view(torch.int16), a.view(torch.int16))
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+def test_receiver_cache_does_not_hide_weights_that_drifted(dev):
+    """Weights modified outside the library: the cache must not vouch for them."""
+    g = torch.Generator().manual_seed(9)
+    w = torch.randn(50_000, generator=g) * 0.02
+    s1, s2 = w.bfloat16().to(dev), (w + 1e-6).bfloat16().to(dev)
+    s3 = (w + 2e-6).bfloat16().to(dev)
+    sender, receiver = {}, {}
+    recv = {"w": s1.clone()}
+    apply_update(recv, encode_update({"w": s1}, {"w": s2}, sender), receiver)
+    recv["w"].view(torch.int16)[7] ^= 1  # drift: one mantissa bit flipped outside the library
+    with pytest.raises(CorruptUpdate):
+        apply_update(recv, encode_update({"w": s2}, {"w": s3}, sender), receiver)
+
+
+def test_sender_cache_is_not_committed_when_encoding_fails(monkeypatch):
+    import crukx_sync
+    a, b = rl_like_pair(20_000, seed=10)
+    cache = {}
+    def boom(_):
+        raise RuntimeError("serialize failed")
+    monkeypatch.setattr(crukx_sync, "serialize", boom)
+    with pytest.raises(RuntimeError):
+        encode_update({"w": a}, {"w": b}, cache)
+    assert cache == {}
+
+
+@pytest.mark.parametrize("n", [4096, 4097, 3 * 4096 + 5])
+def test_multi_slab_paths_and_slab_boundaries(monkeypatch, n):
+    import crukx_sync.codec as codec
+    monkeypatch.setattr(codec, "_SLAB", 4096)
+    for dev in DEVICES:
+        a, b = rl_like_pair(n, seed=n, device=dev)
+        roundtrip({"w": a}, {"w": b})
+        c = a.clone()
+        c[-1] = b[-1] if not torch.equal(a[-1:], b[-1:]) else c[-1]
+        roundtrip({"w": a}, {"w": c})
+
+
+def test_extreme_residuals():
+    a = torch.tensor([0x7FFF, -0x8000, 0, 0x7FFF], dtype=torch.int16)
+    b = torch.tensor([-0x8000, 0x7FFF, 0x7FFF, 0], dtype=torch.int16)
+    roundtrip({"w": a}, {"w": b})
+
+
+def test_hostile_counts_are_rejected_before_allocating():
+    """A short update claiming millions of changes must fail in parse, not allocate."""
+    big = torch.zeros(1 << 22, dtype=torch.int16)
+    out = bytearray(b"CRXS\x02")
+    write_varint(out, 1)
+    out += b"\x00\x01\x02\x01"            # table: exponent 0, 1 symbol (2), length 1
+    write_varint(out, 1)
+    write_varint(out, 1)
+    out += b"w"
+    write_varint(out, big.numel())
+    out += bytes(8)
+    write_varint(out, 1)
+    out += b"\x00"
+    write_varint(out, big.numel())         # every element "changed"
+    out += b"\x00"
+    out += bytes(4 * (big.numel() // 256))  # all blocks claim 0 bits
+    write_varint(out, 0)
+    with pytest.raises(CorruptUpdate):
+        apply_update({"w": big}, bytes(out))
+
+
+def test_encode_rejects_mixed_devices():
+    if "cuda" not in DEVICES:
+        pytest.skip("no GPU")
+    a, b = rl_like_pair(1000)
+    with pytest.raises(ValueError):
+        encode_update({"w": a, "x": a.cuda()}, {"w": b, "x": b.cuda()})
+
+
+def test_encode_on_cpu_apply_on_gpu():
+    if "cuda" not in DEVICES:
+        pytest.skip("no GPU")
+    a, b = rl_like_pair()
+    roundtrip({"w": a}, {"w": b}, apply_device="cuda")

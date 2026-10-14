@@ -6,8 +6,12 @@
 Nothing is written unless the whole update decodes and every tensor's checksum verifies.
 
 For per-step sync, pass a `checksums` dict on each side and keep it between steps: checksums are
-then updated from the changed elements only instead of re-reading every tensor. A stale or wrong
-cache makes the next update fail verification (CorruptUpdate); it never yields wrong weights.
+then updated from the changed elements only instead of re-reading every tensor.
+- Sender: a wrong cache produces an update the receiver rejects (CorruptUpdate), never wrong weights.
+- Receiver: a cached checksum is used only while the tensor's `_version` is unchanged since this
+  library last wrote it; any PyTorch in-place op bumps it and forces a full re-check. Writes that
+  bypass PyTorch's version counter (raw pointers, some collective libraries) are not detected, so
+  drop the receiver cache if weights can change that way.
 Format: docs/FORMAT.md.
 """
 
@@ -32,16 +36,20 @@ class UpdateStats:
 
 
 def encode_update(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
-                  checksums: dict[str, int] | None = None) -> bytes:
+                  checksums: dict | None = None) -> bytes:
     """Bytes that turn `old` into `new` exactly. Same names and shapes; tensors are bf16 or int16."""
     if old.keys() != new.keys():
         raise ValueError(f"old and new differ in tensor names: {sorted(old.keys() ^ new.keys())[:5]}")
     with torch.no_grad():
-        return serialize(codec.encode(old, new, checksums))
+        update, new_checksums = codec.encode(old, new, checksums)
+    data = serialize(update)
+    if checksums is not None:  # commit only once the update exists
+        checksums.update(new_checksums)
+    return data
 
 
 def apply_update(weights: Mapping[str, torch.Tensor], update: bytes,
-                 checksums: dict[str, int] | None = None) -> UpdateStats:
+                 checksums: dict | None = None) -> UpdateStats:
     """Write the update into `weights` in place; on any error nothing is written."""
     u = parse(update)
     with torch.no_grad():
