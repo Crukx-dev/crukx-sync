@@ -13,6 +13,8 @@ import json, os, random, re, sys, time
 import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from crukx_sync import apply_update, encode_update
+sys.path.insert(0, os.path.dirname(__file__))
+import compare  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL = os.environ.get("CRUKX_BENCH_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")  # HF id or local path
@@ -99,6 +101,8 @@ for step in range(1, STEPS + 1):
     row = {"step": step, "reward": round(r.mean().item(), 3), "loss": round(loss.item(), 4),
            "step_s": round(time.time() - t0, 1), "gen_s": round(gen_s, 1), "bwd_s": round(bwd_s, 1), "opt_s": round(opt_s, 1)}
     torch.cuda.synchronize(); t1 = time.time(); upd = encode_update(prev, cur, send_chk); torch.cuda.synchronize(); enc_s = time.time() - t1
+    # other formats on the identical update (before the receiver applies it in place)
+    others = compare.sizes(prev, cur) if os.environ.get("CRUKX_BENCH_COMPARE") else {}
     recv = prev  # the receiver's own tensors, updated in place every step
     t1 = time.time(); stats = apply_update(recv, upd, recv_chk); torch.cuda.synchronize(); dec_s = time.time() - t1
     exact = all(torch.equal(recv[k].view(torch.int16), cur[k].view(torch.int16)) for k in cur)
@@ -108,6 +112,7 @@ for step in range(1, STEPS + 1):
                 "full_over_update": round(full / len(upd), 1),
                 "verl_over_update": round(6 * stats.changed / len(upd), 2),
                 "encode_s": round(enc_s, 3), "apply_s": round(dec_s, 3), "exact": exact})
+    row.update({f"{k}_bytes": v for k, v in others.items()})
     assert exact, "receiver does not match the trainer"
     rows.append(row); print(json.dumps(row), flush=True)
     # `prev` (the receiver's tensors) now equals `cur`; keep the same tensors, as a real worker does
