@@ -16,7 +16,7 @@ Per step, vs the previous broadcast: changed fraction, the old-exponent-context 
 bound (R1e) and the concrete Rice+Huffman format size (R1f).
 """
 import json, os, random, re, sys, time
-import numpy as np, torch
+import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from crukx_sync import apply_update, encode_update
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -49,11 +49,12 @@ def reward(out, ans):
 
 
 def bf16_state():
-    """The broadcast: bf16 bit patterns as numpy uint16, per tensor."""
-    return {n: p.detach().view(torch.int16).cpu().numpy().view(np.uint16).copy() for n, p in policy.named_parameters()}
+    """The broadcast: a GPU copy of the bf16 weights."""
+    return {n: p.detach().clone() for n, p in policy.named_parameters()}
 
 
 prev = bf16_state(); rows = []
+send_chk, recv_chk = {}, {}  # checksum caches kept across steps (first step computes them)
 for step in range(1, STEPS + 1):
     t0 = time.time()
     tasks = [task() for _ in range(PROMPTS)]
@@ -87,16 +88,16 @@ for step in range(1, STEPS + 1):
     cur = bf16_state()
     row = {"step": step, "reward": round(r.mean().item(), 3), "loss": round(loss.item(), 4),
            "step_s": round(time.time() - t0, 1)}
-    t1 = time.time(); upd = encode_update(prev, cur); enc_s = time.time() - t1
-    recv = {k: v.copy() for k, v in prev.items()}
-    t1 = time.time(); stats = apply_update(recv, upd); dec_s = time.time() - t1
-    exact = all(np.array_equal(recv[k], cur[k]) for k in cur)
+    torch.cuda.synchronize(); t1 = time.time(); upd = encode_update(prev, cur, send_chk); torch.cuda.synchronize(); enc_s = time.time() - t1
+    recv = prev  # the receiver holds the previous broadcast; apply in place
+    t1 = time.time(); stats = apply_update(recv, upd, recv_chk); torch.cuda.synchronize(); dec_s = time.time() - t1
+    exact = all(torch.equal(recv[k].view(torch.int16), cur[k].view(torch.int16)) for k in cur)
     full = 2 * total
     row.update({"changed_frac": round(stats.changed / total, 5), "update_bytes": len(upd),
                 "B_per_change": round(len(upd) / max(stats.changed, 1), 3),
                 "full_over_update": round(full / len(upd), 1),
                 "verl_over_update": round(6 * stats.changed / len(upd), 2),
-                "encode_s": round(enc_s, 2), "apply_s": round(dec_s, 2), "exact": exact})
+                "encode_s": round(enc_s, 3), "apply_s": round(dec_s, 3), "exact": exact})
     assert exact, "receiver does not match the trainer"
     rows.append(row); print(json.dumps(row), flush=True)
     prev = cur

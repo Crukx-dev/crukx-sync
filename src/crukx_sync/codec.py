@@ -1,90 +1,88 @@
-"""Encode and decode one tensor's update (docs/FORMAT.md). Inputs are uint16 bf16 bit patterns.
+"""Encode and apply updates with torch, on CPU or GPU (docs/FORMAT.md, version 2).
 
-The encoder and decoder are vectorised with numpy across 256-element blocks; every block decodes
-independently, which is the shape a GPU kernel will take.
+Everything is vectorised over the whole update. The decoder runs all 256-symbol blocks of all
+tensors in one loop of 256 steps; corrupt input only raises flags (indices are clamped), checked
+once at the end, so bad bytes can never trigger a device-side assert.
 """
 
 from __future__ import annotations
 
 import heapq
-from dataclasses import dataclass
+from collections.abc import Mapping
 
-import numpy as np
+import torch
 
-from .wire import CorruptUpdate
+from .wire import (BLOCK, MAX_CODE_LEN, MAX_SYMBOL, MAX_RICE, CorruptUpdate, Group, Table,
+                   TensorHeader, Update, n_blocks)
 
-BLOCK = 256
-MAX_CODE_LEN = 17  # residuals span +-65535: <= 131071 zigzag symbols always fit
-MAX_SYMBOL = 131070
-MAX_RICE = 30
-_GOLDEN = np.uint64(0x9E3779B97F4A7C15)
-
-
-@dataclass
-class Group:
-    exponent: int
-    count: int
-    rice_r: int
-    symbols: np.ndarray  # zigzag residual symbols (uint32)
-    lengths: np.ndarray  # canonical Huffman code length per symbol
+_SYM_SPACE = MAX_SYMBOL + 1
+_SMALL = 64  # residual symbols below this are counted with a dense bincount
+_MASK64 = (1 << 64) - 1
 
 
-@dataclass
-class TensorUpdate:
-    numel: int
-    checksum: int
-    groups: list[Group]
-    block_bits: np.ndarray  # bit length of every block, groups in order
-    payload: bytes
+def _i64(v: int) -> int:
+    """A uint64 constant as signed int64 (torch int64 arithmetic wraps mod 2^64)."""
+    return v - (1 << 64) if v >= 1 << 63 else v
+
+
+_GOLDEN, _MIX1, _MIX2 = _i64(0x9E3779B97F4A7C15), _i64(0xBF58476D1CE4E5B9), _i64(0x94D049BB133111EB)
+_CHUNK = 1 << 24   # elements per checksum chunk
+_SLAB = 1 << 24    # elements sorted at once: bounds temporary memory for any tensor size
 
 
 # ---------------------------------------------------------------- shared helpers
 
-def exponent_order(old: np.ndarray):
-    """Element order by old bf16 exponent (stable) and each exponent's start in that order."""
-    exps = ((old >> 7) & 0xFF).astype(np.uint8)
-    order = np.argsort(exps, kind="stable")
-    starts = np.zeros(257, dtype=np.int64)
-    starts[1:] = np.cumsum(np.bincount(exps, minlength=256))
-    return order, starts
+def bits16(name: str, t: torch.Tensor) -> torch.Tensor:
+    """Flat int16 view of a bf16 (or int16 bit-pattern) tensor."""
+    if not isinstance(t, torch.Tensor) or t.dtype not in (torch.bfloat16, torch.int16):
+        raise ValueError(f"{name}: expected a bfloat16 or int16 torch tensor, got {getattr(t, 'dtype', type(t))}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name}: tensor must be contiguous")
+    return t.view(torch.int16).view(-1)
 
 
-def checksum(bits: np.ndarray, chunk: int = 1 << 22) -> int:
-    """Position-weighted 64-bit sum of uint16 bits (see FORMAT.md, Integrity)."""
-    total = np.uint64(0)
-    with np.errstate(over="ignore"):
-        for lo in range(0, bits.size, chunk):
-            idx = np.arange(lo, min(lo + chunk, bits.size), dtype=np.uint64)
-            w = (idx * _GOLDEN) | np.uint64(1)
-            total += np.sum(bits[lo:lo + chunk].astype(np.uint64) * w, dtype=np.uint64)
-    return int(total)
+def exponents(a: torch.Tensor) -> torch.Tensor:
+    return ((a >> 7) & 0xFF).long()
 
 
-def _zigzag(v: np.ndarray) -> np.ndarray:
-    return ((v << 1) ^ (v >> 31)).astype(np.uint32)
+def _shr(z: torch.Tensor, s: int) -> torch.Tensor:
+    """Logical right shift of int64 bit patterns."""
+    return (z >> s) & ((1 << (64 - s)) - 1)
 
 
-def _unzigzag(z: np.ndarray) -> np.ndarray:
-    z = z.astype(np.int64)
-    return (z >> 1) ^ -(z & 1)
+def _weights(idx: torch.Tensor) -> torch.Tensor:
+    """splitmix64(i) | 1: a non-linear per-position weight, so structured errors cannot cancel."""
+    z = idx * _GOLDEN + _GOLDEN
+    z = (z ^ _shr(z, 30)) * _MIX1
+    z = (z ^ _shr(z, 27)) * _MIX2
+    return (z ^ _shr(z, 31)) | 1
 
 
-def _huffman_lengths(counts: np.ndarray) -> np.ndarray:
+def checksum(a: torch.Tensor) -> int:
+    """sum(u_i * w_i) mod 2^64 over the uint16 bits u_i (FORMAT.md, Integrity)."""
+    total = torch.zeros((), dtype=torch.long, device=a.device)
+    for lo in range(0, a.numel(), _CHUNK):
+        hi = min(lo + _CHUNK, a.numel())
+        idx = torch.arange(lo, hi, dtype=torch.long, device=a.device)
+        total += ((a[lo:hi].long() & 0xFFFF) * _weights(idx)).sum()
+    return int(total) & _MASK64
+
+
+def huffman_lengths(counts: list[int]) -> list[int]:
     """Huffman code lengths limited to MAX_CODE_LEN (flatten skewed counts, else equal lengths)."""
-    counts = np.asarray(counts, dtype=np.int64)
     for _ in range(8):
-        lengths = _huffman_lengths_unlimited(counts)
-        if lengths.max() <= MAX_CODE_LEN:
+        lengths = _huffman_unlimited(counts)
+        if max(lengths) <= MAX_CODE_LEN:
             return lengths
-        counts = np.maximum(1, counts >> 2)
-    return np.full(len(counts), max(1, int(np.ceil(np.log2(len(counts))))), dtype=np.uint8)
+        counts = [max(1, c >> 2) for c in counts]
+    return [max(1, (len(counts) - 1).bit_length())] * len(counts)
 
 
-def _huffman_lengths_unlimited(counts: np.ndarray) -> np.ndarray:
+def _huffman_unlimited(counts: list[int]) -> list[int]:
     n = len(counts)
     if n == 1:
-        return np.ones(1, dtype=np.uint8)
-    heap = [(int(c), i) for i, c in enumerate(counts)]
+        return [1]
+    heap = [(c, i) for i, c in enumerate(counts)]
     heapq.heapify(heap)
     parent = [0] * (2 * n - 1)
     nxt = n
@@ -94,203 +92,324 @@ def _huffman_lengths_unlimited(counts: np.ndarray) -> np.ndarray:
         parent[a] = parent[b] = nxt
         heapq.heappush(heap, (c1 + c2, nxt))
         nxt += 1
-    depth = [0] * (2 * n - 1)  # root is the last node; parents always have larger ids
+    depth = [0] * (2 * n - 1)  # the root is the last node; parents have larger ids
     for node in range(2 * n - 3, -1, -1):
         depth[node] = depth[parent[node]] + 1
-    return np.array(depth[:n], dtype=np.int64)
+    return depth[:n]
 
 
-def _canonical_codes(lengths: np.ndarray) -> np.ndarray:
-    """Canonical Huffman codes for lengths, in the given symbol order (symbols sorted ascending)."""
-    order = np.lexsort((np.arange(len(lengths)), lengths))
-    codes = np.zeros(len(lengths), dtype=np.int64)
-    code, prev = 0, int(lengths[order[0]])
+def canonical_codes(lengths: list[int]) -> list[int]:
+    """Canonical codes, assigned in order of (length, position in the table)."""
+    order = sorted(range(len(lengths)), key=lambda i: (lengths[i], i))
+    codes = [0] * len(lengths)
+    code, prev = 0, lengths[order[0]]
     for k, i in enumerate(order):
-        L = int(lengths[i])
         if k:
-            code = (code + 1) << (L - prev)
+            code = (code + 1) << (lengths[i] - prev)
         codes[i] = code
-        prev = L
+        prev = lengths[i]
     return codes
 
 
-def _check_kraft(lengths: np.ndarray) -> None:
-    if len(lengths) == 0 or lengths.min() < 1 or lengths.max() > MAX_CODE_LEN:
-        raise CorruptUpdate("bad Huffman code length")
-    if np.sum(2.0 ** -lengths.astype(np.float64)) > 1.0 + 1e-12:
-        raise CorruptUpdate("Huffman code lengths overflow the code space")
+def _exclusive_cumsum(x: torch.Tensor) -> torch.Tensor:
+    return torch.cumsum(x, 0) - x
+
+
+def _slab_hists(a: torch.Tensor) -> torch.Tensor:
+    """Exponent histogram of every slab: [n_slabs, 256]."""
+    return torch.stack([torch.bincount(exponents(a[lo:lo + _SLAB]), minlength=256)
+                        for lo in range(0, a.numel(), _SLAB)])
+
+
+def _sorted_slab(a: torch.Tensor, lo: int):
+    """One slab's exponents (int16), their stable sort order, and where each exponent starts in
+    that order ([257]). A stable sort on 16-bit keys is the fastest rank/select we measured."""
+    e = (a[lo:lo + _SLAB] >> 7) & 0xFF
+    order = torch.argsort(e, stable=True)
+    starts = torch.searchsorted(e[order], torch.arange(257, dtype=e.dtype, device=e.device))
+    return e, order, starts
+
+
+def _changed_ranks(a: torch.Tensor, m: torch.Tensor):
+    """For changed elements: (exponent, rank among same-exponent elements, position), sorted by
+    (exponent, rank): the order of a stable sort by exponent, done slab by slab."""
+    before = torch.zeros(256, dtype=torch.long, device=a.device)
+    out = []
+    for lo in range(0, a.numel(), _SLAB):
+        e, order, starts = _sorted_slab(a, lo)
+        r = torch.nonzero(m[lo:lo + _SLAB][order]).flatten()
+        if r.numel():
+            x = e[order[r]].long()
+            out.append((x, before[x] + r - starts[x], lo + order[r]))
+        before += starts[1:] - starts[:-1]
+    ex, rank, src = (torch.cat(t) for t in zip(*out))
+    key = torch.argsort((ex << 40) + rank)
+    return ex[key], rank[key], src[key]
+
+
+def _positions(a: torch.Tensor, ex: torch.Tensor, rank: torch.Tensor, hists: torch.Tensor) -> torch.Tensor:
+    """Inverse of _changed_ranks: element positions for (exponent, rank) pairs."""
+    slab_before = _exclusive_cumsum(hists)                     # [n_slabs, 256]
+    slab = torch.searchsorted(slab_before.T.contiguous()[ex], rank.unsqueeze(1), right=True).squeeze(1) - 1
+    pos = torch.empty_like(rank)
+    for s, lo in enumerate(range(0, a.numel(), _SLAB)):
+        sel = torch.nonzero(slab == s).flatten()
+        if sel.numel() == 0:
+            continue
+        _, order, starts = _sorted_slab(a, lo)
+        x = ex[sel]
+        pos[sel] = lo + order[starts[x] + rank[sel] - slab_before[s, x]]
+    return pos
 
 
 # ---------------------------------------------------------------- encoder
 
-def encode_tensor(old: np.ndarray, new: np.ndarray) -> TensorUpdate | None:
-    """Update turning `old` into `new` (flat uint16 arrays), or None if they are identical."""
-    changed = old != new
-    if not changed.any():
-        return None
-    order, starts = exponent_order(old)
-    pos = np.flatnonzero(changed[order])
-    exps = ((old[order[pos]] >> 7) & 0xFF).astype(np.int64)
-    local = pos - starts[exps]
-    first = np.r_[True, exps[1:] != exps[:-1]]
-    prev_local = np.r_[-1, local[:-1]]
-    prev_local[first] = -1
-    gaps = (local - prev_local - 1).astype(np.int64)
-    res = new[order[pos]].view(np.int16).astype(np.int64) - old[order[pos]].view(np.int16).astype(np.int64)
-    zz = _zigzag(res)
+def _new_checksum(name, a, b, idx, checksums) -> int:
+    """Checksum of `b`: incremental from the cached checksum of `a` when available."""
+    if checksums is not None and name in checksums:
+        d = (b[idx].long() & 0xFFFF) - (a[idx].long() & 0xFFFF)
+        return (checksums[name] + int((d * _weights(idx)).sum())) & _MASK64
+    return checksum(b)
 
-    groups: list[Group] = []
-    rice = np.empty(len(pos), dtype=np.int64)
-    hcode = np.empty(len(pos), dtype=np.int64)
-    hlen = np.empty(len(pos), dtype=np.int64)
-    block_bits: list[np.ndarray] = []
-    cuts = np.flatnonzero(np.r_[True, exps[1:] != exps[:-1], True])
-    for lo, hi in zip(cuts[:-1], cuts[1:]):
-        g = gaps[lo:hi]
-        costs = [int((g >> r).sum()) + len(g) * (1 + r) for r in range(MAX_RICE + 1)]
-        r = int(np.argmin(costs))
-        syms, inv, cnt = np.unique(zz[lo:hi], return_inverse=True, return_counts=True)
-        lengths = _huffman_lengths(cnt)
-        codes = _canonical_codes(lengths)
-        rice[lo:hi] = r
-        hcode[lo:hi] = codes[inv]
-        hlen[lo:hi] = lengths[inv]
-        groups.append(Group(int(exps[lo]), int(hi - lo), r, syms, lengths))
 
-    q = gaps >> rice
-    rice_len = q + 1 + rice
-    elem_bits = rice_len + hlen
-    starts_bit = np.concatenate([[0], np.cumsum(elem_bits)[:-1]])
-    total_bits = int(elem_bits.sum())
-    bits = np.zeros(total_bits + 8, dtype=np.uint8)
-    # unary ones
-    ones_at = np.repeat(starts_bit, q) + (np.arange(int(q.sum())) - np.repeat(np.cumsum(q) - q, q))
-    bits[ones_at] = 1
-    # Rice remainder, MSB first
-    rem_start = starts_bit + q + 1
-    for j in range(int(rice.max()) + 1):
-        m = j < rice
-        bits[rem_start[m] + j] = (gaps[m] >> (rice[m] - 1 - j)) & 1
-    # Huffman code, MSB first
-    h_start = starts_bit + rice_len
-    for j in range(int(hlen.max())):
-        m = j < hlen
-        bits[h_start[m] + j] = (hcode[m] >> (hlen[m] - 1 - j)) & 1
+def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
+           checksums: dict[str, int] | None = None) -> Update:
+    headers, E, G, Z, group_counts = [], [], [], [], []
+    new_checksums = {}  # committed to `checksums` only if the whole encode succeeds
+    pairs = {}
+    for name in old:
+        a, b = bits16(name, old[name]), bits16(name, new[name])
+        if a.shape != b.shape or a.device != b.device:
+            raise ValueError(f"{name}: old and new differ in shape or device")
+        pairs[name] = (a, b)
+    if not pairs:
+        return Update([], [])
+    changed_any = torch.stack([(a != b).any() for a, b in pairs.values()]).tolist()  # one sync
+    for (name, (a, b)), any_change in zip(pairs.items(), changed_any):
+        if not any_change:
+            continue
+        m = a != b
+        ex, local, src = _changed_ranks(a, m)
+        first = torch.ones_like(ex, dtype=torch.bool)
+        first[1:] = ex[1:] != ex[:-1]
+        prev = torch.roll(local, 1)
+        prev[first] = -1
+        res = b[src].long() - a[src].long()
+        exps, counts = torch.unique_consecutive(ex, return_counts=True)
+        chk = new_checksums[name] = _new_checksum(name, a, b, src, checksums)
+        headers.append(TensorHeader(name, a.numel(), chk,
+                                    [Group(int(x), int(c), 0) for x, c in zip(exps.tolist(), counts.tolist())]))
+        E.append(ex)
+        G.append(local - prev - 1)
+        Z.append((res << 1) ^ (res >> 63))
+        group_counts += counts.tolist()
+    if not headers:
+        return Update([], [])
+    if checksums is not None:
+        checksums.update(new_checksums)
+    E, G, Z = torch.cat(E), torch.cat(G), torch.cat(Z)
+    dev, n = E.device, E.numel()
+    counts = torch.tensor(group_counts, dtype=torch.long, device=dev)
+    gid = torch.repeat_interleave(torch.arange(len(group_counts), device=dev), counts)
 
-    for lo, hi in zip(cuts[:-1], cuts[1:]):
-        b = elem_bits[lo:hi]
-        block_bits.append(np.add.reduceat(b, np.arange(0, len(b), BLOCK)))
-    payload = np.packbits(bits[:total_bits], bitorder="big").tobytes()
-    return TensorUpdate(old.size, checksum(new), groups, np.concatenate(block_bits), payload)
+    # Rice parameter per group: cheapest total length
+    costs = torch.stack([torch.zeros(len(group_counts), dtype=torch.long, device=dev)
+                         .scatter_add_(0, gid, (G >> r) + 1 + r) for r in range(MAX_RICE + 1)])
+    rice_g = costs.argmin(0)
+    R = rice_g[gid]
+
+    # Huffman table per exponent, shared by the whole update
+    # count (exponent, symbol) pairs: dense bincount for small symbols, unique() for the rare rest
+    key = E * _SYM_SPACE + Z
+    small = Z < _SMALL
+    dense = torch.bincount(E[small] * _SMALL + Z[small], minlength=256 * _SMALL)
+    nz = torch.nonzero(dense).flatten()
+    rare_keys, rare_counts = torch.unique(key[~small], return_counts=True)
+    keys = torch.cat([(nz // _SMALL) * _SYM_SPACE + nz % _SMALL, rare_keys])
+    kcount = torch.cat([dense[nz], rare_counts])
+    srt = torch.argsort(keys)
+    keys, kcount = keys[srt], kcount[srt]
+    inv = torch.searchsorted(keys, key)
+    keys, kcount = keys.tolist(), kcount.tolist()
+    code_of, len_of, tables, lo = [0] * len(keys), [0] * len(keys), [], 0
+    while lo < len(keys):
+        exp = keys[lo] // _SYM_SPACE
+        hi = lo
+        while hi < len(keys) and keys[hi] // _SYM_SPACE == exp:
+            hi += 1
+        lengths = huffman_lengths(kcount[lo:hi])
+        code_of[lo:hi], len_of[lo:hi] = canonical_codes(lengths), lengths
+        tables.append(Table(exp, [k % _SYM_SPACE for k in keys[lo:hi]], lengths))
+        lo = hi
+    HC = torch.tensor(code_of, dtype=torch.long, device=dev)[inv]
+    HL = torch.tensor(len_of, dtype=torch.long, device=dev)[inv]
+
+    # bit lengths, blocks
+    q = G >> R
+    Lr = q + 1 + R
+    L = Lr + HL
+    start = _exclusive_cumsum(L)
+    total_bits = int(L.sum())
+    k_in_group = torch.arange(n, device=dev) - _exclusive_cumsum(counts)[gid]
+    blocks_per_group = (counts + BLOCK - 1) // BLOCK
+    bid = _exclusive_cumsum(blocks_per_group)[gid] + k_in_group // BLOCK
+    block_bits = torch.zeros(int(blocks_per_group.sum()), dtype=torch.long, device=dev).scatter_add_(0, bid, L)
+
+    # set bits: unary ones, Rice remainder (MSB first), Huffman code (MSB first)
+    ones = [torch.repeat_interleave(start, q)
+            + torch.arange(int(q.sum()), device=dev) - torch.repeat_interleave(_exclusive_cumsum(q), q)]
+    for j in range(int(R.max()) + 1):
+        bit = (j < R) & (((G >> (R - 1 - j).clamp(min=0)) & 1) == 1)
+        ones.append((start + q + 1 + j)[bit])
+    for j in range(int(HL.max())):
+        bit = (j < HL) & (((HC >> (HL - 1 - j).clamp(min=0)) & 1) == 1)
+        ones.append((start + Lr + j)[bit])
+    pos = torch.cat(ones)
+    words = torch.zeros(total_bits // 32 + 1, dtype=torch.long, device=dev)
+    words.scatter_add_(0, pos >> 5, torch.ones_like(pos) << (31 - (pos & 31)))
+    payload = torch.stack([(words >> s) & 0xFF for s in (24, 16, 8, 0)], 1).flatten()
+    payload = payload[: (total_bits + 7) // 8].to(torch.uint8).cpu().numpy().tobytes()
+
+    rice_list = rice_g.tolist()
+    gi = 0
+    for h in headers:
+        for g in h.groups:
+            g.rice_r = rice_list[gi]
+            gi += 1
+    return Update(tables, headers, block_bits.tolist(), payload)
 
 
 # ---------------------------------------------------------------- decoder
 
-def _read_bits(buf: np.ndarray, pos: np.ndarray, n: np.ndarray) -> np.ndarray:
-    """Read n[i] (<= 32) bits starting at bit pos[i] from a byte buffer padded with 8 zero bytes."""
-    byte = pos >> 3
-    win = np.zeros(len(pos), dtype=np.uint64)
-    for k in range(8):
-        win |= buf[byte + k].astype(np.uint64) << np.uint64(56 - 8 * k)
-    win <<= (pos & 7).astype(np.uint64)
-    out = np.zeros(len(pos), dtype=np.int64)
-    nz = n > 0
-    out[nz] = (win[nz] >> (np.uint64(64) - n[nz].astype(np.uint64))).astype(np.int64)
-    return out
+def _read_bits(buf: torch.Tensor, pos: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+    """n (<= 32) bits at bit position pos, MSB first; pos is clamped into the buffer."""
+    byte = (pos >> 3).clamp(0, buf.numel() - 5)
+    win = torch.zeros_like(pos)
+    for k in range(5):
+        win |= buf[byte + k].long() << (32 - 8 * k)
+    return (win >> (40 - (pos & 7) - n)) & ((torch.ones_like(n) << n) - 1)
 
 
-def decode_tensor(old: np.ndarray, upd: TensorUpdate) -> np.ndarray:
-    """New uint16 bits for one tensor; raises CorruptUpdate if the update does not decode exactly."""
-    order, starts = exponent_order(old)
-    sizes = np.diff(starts)
-    total = sum(g.count for g in upd.groups)
-    n_blocks = sum(-(-g.count // BLOCK) for g in upd.groups)
-    if len(upd.block_bits) != n_blocks:
+def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict[str, int] | None = None) -> int:
+    """Verify `u` against `weights`, then write the new values in place. Returns elements changed."""
+    if not u.tensors:
+        return 0
+    targets = []
+    for h in u.tensors:
+        if h.name not in weights:
+            raise ValueError(f"update has tensor {h.name!r} that the receiver does not have")
+        a = bits16(h.name, weights[h.name])
+        if a.numel() != h.numel:
+            raise ValueError(f"{h.name}: update is for {h.numel} elements, receiver has {a.numel()}")
+        targets.append(a)
+    dev = targets[0].device
+    if any(a.device != dev for a in targets):
+        raise ValueError("all updated tensors must be on one device")
+
+    # per group / per block tables (small, built on CPU)
+    table_of = {t.exponent: i for i, t in enumerate(u.tables)}
+    g_count, g_rice, g_table, g_size = [], [], [], []
+    # exact group sizes need a pass over the tensor; single-slab tensors get them later from the
+    # same sort that places the changes, so until then their bound is numel
+    hists = [_slab_hists(a) if a.numel() > _SLAB else None for a in targets]
+    for h, a, hist in zip(u.tensors, targets, hists):
+        sizes = hist.sum(0).tolist() if hist is not None else [a.numel()] * 256
+        for g in h.groups:
+            if g.count > sizes[g.exponent]:
+                raise CorruptUpdate("group has more changes than elements")
+            g_count.append(g.count)
+            g_rice.append(g.rice_r)
+            g_table.append(table_of[g.exponent])
+            g_size.append(sizes[g.exponent])
+    counts = torch.tensor(g_count, dtype=torch.long, device=dev)
+    rice_g = torch.tensor(g_rice, dtype=torch.long, device=dev)
+    size_g = torch.tensor(g_size, dtype=torch.long, device=dev)
+    nb_g = (counts + BLOCK - 1) // BLOCK
+    if int(nb_g.sum()) != len(u.block_bits):
         raise CorruptUpdate("block table does not match group counts")
-    if sum(upd.block_bits.tolist()) > 8 * len(upd.payload):  # Python ints: no wraparound
-        raise CorruptUpdate("payload shorter than its block table")
+    blk_group = torch.repeat_interleave(torch.arange(len(g_count), device=dev), nb_g)
+    blk_k = torch.arange(len(u.block_bits), device=dev) - _exclusive_cumsum(nb_g)[blk_group]
+    blk_count = torch.clamp(counts[blk_group] - blk_k * BLOCK, max=BLOCK)
+    elem_base = _exclusive_cumsum(counts)[blk_group] + blk_k * BLOCK
+    rice = rice_g[blk_group]
+    q_max = size_g[blk_group] >> rice
+    tbl = torch.tensor(g_table, dtype=torch.long, device=dev)[blk_group]
+    bb = torch.tensor(u.block_bits, dtype=torch.long, device=dev)
+    cur = _exclusive_cumsum(bb)
+    blk_end = cur + bb
 
-    # per-block tables
-    blk_group, blk_count = [], []
-    seen = set()
-    lmax = 1
-    for gi, g in enumerate(upd.groups):
-        if g.exponent in seen or not 0 < g.count <= sizes[g.exponent] or g.rice_r > MAX_RICE:
-            raise CorruptUpdate("bad group header")
-        if len(np.unique(g.symbols)) != len(g.symbols) or g.symbols.max() > MAX_SYMBOL:
-            raise CorruptUpdate("bad symbol table")
-        seen.add(g.exponent)
-        _check_kraft(g.lengths)
-        lmax = max(lmax, int(g.lengths.max()))
-        nb = -(-g.count // BLOCK)
-        blk_group += [gi] * nb
-        blk_count += [min(BLOCK, g.count - b * BLOCK) for b in range(nb)]
-    blk_group = np.array(blk_group, dtype=np.int64)
-    blk_count = np.array(blk_count, dtype=np.int64)
-    elem_base = np.cumsum(np.r_[0, blk_count[:-1]])
-    cur = np.concatenate([[0], np.cumsum(upd.block_bits)[:-1]]).astype(np.int64)
-    blk_end = cur + upd.block_bits.astype(np.int64)
+    lmax = max(max(t.lengths) for t in u.tables)
+    lut_sym = torch.zeros(len(u.tables), 1 << lmax, dtype=torch.long)
+    lut_len = torch.zeros(len(u.tables), 1 << lmax, dtype=torch.long)
+    for ti, t in enumerate(u.tables):
+        for s, c, L in zip(t.symbols, canonical_codes(t.lengths), t.lengths):
+            lut_sym[ti, c << (lmax - L):(c + 1) << (lmax - L)] = s
+            lut_len[ti, c << (lmax - L):(c + 1) << (lmax - L)] = L
+    lut_sym, lut_len = lut_sym.to(dev), lut_len.to(dev)
 
-    # lookup table per group: peek lmax bits -> (symbol, length); length 0 = invalid code
-    lut_sym = np.zeros((len(upd.groups), 1 << lmax), dtype=np.int64)
-    lut_len = np.zeros((len(upd.groups), 1 << lmax), dtype=np.int64)
-    for gi, g in enumerate(upd.groups):
-        codes = _canonical_codes(g.lengths)
-        for s, c, L in zip(g.symbols.tolist(), codes.tolist(), g.lengths.tolist()):
-            lo, hi = c << (lmax - L), (c + 1) << (lmax - L)
-            lut_sym[gi, lo:hi] = s
-            lut_len[gi, lo:hi] = L
-    rice = np.array([g.rice_r for g in upd.groups], dtype=np.int64)[blk_group]
-    # a gap can never reach its group's size; bounding q keeps (q << r) and cumsum in int64
-    q_max = np.array([int(sizes[g.exponent]) >> g.rice_r for g in upd.groups], dtype=np.int64)[blk_group]
-
-    buf = np.frombuffer(upd.payload + bytes(16), dtype=np.uint8)
-    bitarr = np.unpackbits(buf, bitorder="big")
-    zeros = np.flatnonzero(bitarr == 0)
-    gaps = np.zeros(total, dtype=np.int64)
-    zz = np.zeros(total, dtype=np.int64)
+    buf = torch.frombuffer(bytearray(u.payload + bytes(16)), dtype=torch.uint8).to(dev)
+    bits = ((buf.unsqueeze(1) >> torch.arange(7, -1, -1, device=dev)) & 1).flatten()
+    zeros = torch.nonzero(bits == 0).flatten()
+    total = int(counts.sum())
+    gaps = torch.zeros(total + 1, dtype=torch.long, device=dev)  # last slot absorbs inactive writes
+    zz = torch.zeros(total + 1, dtype=torch.long, device=dev)
+    lmax_t = torch.full_like(cur, lmax)
+    bad = torch.zeros((), dtype=torch.bool, device=dev)
     for step in range(BLOCK):
-        act = np.flatnonzero(step < blk_count)
-        if act.size == 0:
-            break
-        c = cur[act]
-        if (c >= blk_end[act]).any():
-            raise CorruptUpdate("block ends before all its symbols are decoded")
-        k = np.searchsorted(zeros, c)
-        if (k >= len(zeros)).any():
-            raise CorruptUpdate("unterminated Rice code")
-        nxt = zeros[k]  # end of the unary run
-        q = nxt - c
-        if (q > q_max[act]).any():
-            raise CorruptUpdate("Rice code longer than its group")
+        active = step < blk_count
+        bad |= (active & (cur >= blk_end)).any()
+        k = torch.searchsorted(zeros, cur)
+        bad |= (active & (k >= zeros.numel())).any()
+        nxt = zeros[k.clamp(max=zeros.numel() - 1)]
+        q = nxt - cur
+        bad |= (active & (q > q_max)).any()
         c = nxt + 1
-        r = rice[act]
-        rem = _read_bits(buf, c, r)
-        c = c + r
-        peek = _read_bits(buf, c, np.full(act.size, lmax))
-        L = lut_len[blk_group[act], peek]
-        if (L == 0).any():
-            raise CorruptUpdate("invalid Huffman code")
-        out = elem_base[act] + step
-        gaps[out] = (q << r) | rem
-        zz[out] = lut_sym[blk_group[act], peek]
-        cur[act] = c + L
-    if (cur != blk_end).any():
-        raise CorruptUpdate("block lengths do not match decoded bits")
+        rem = _read_bits(buf, c, rice)
+        c = c + rice
+        peek = _read_bits(buf, c, lmax_t)
+        L = lut_len[tbl, peek]
+        bad |= (active & (L == 0)).any()
+        out = torch.where(active, elem_base + step, total)
+        gaps[out] = (q.clamp(0, 1 << 32) << rice) | rem
+        zz[out] = lut_sym[tbl, peek]
+        cur = torch.where(active, c + L, cur)
+    bad |= (cur != blk_end).any()
+    gaps, zz = gaps[:total], zz[:total]
 
-    new = old.copy()
-    lo = 0
-    for g in upd.groups:
-        hi = lo + g.count
-        if (gaps[lo:hi] >= sizes[g.exponent]).any():
-            raise CorruptUpdate("gap larger than its exponent group")
-        local = np.cumsum(gaps[lo:hi] + 1) - 1
-        if local[-1] >= sizes[g.exponent]:
-            raise CorruptUpdate("position outside its exponent group")
-        idx = order[starts[g.exponent] + local]
-        val = old[idx].view(np.int16).astype(np.int64) + _unzigzag(zz[lo:hi])
-        new[idx] = (val & 0xFFFF).astype(np.uint16)
-        lo = hi
-    if checksum(new) != upd.checksum:
-        raise CorruptUpdate("checksum mismatch after applying the update")
-    return new
+    elem_group = torch.repeat_interleave(torch.arange(len(g_count), device=dev), counts)
+    bad |= (gaps >= size_g[elem_group]).any()
+    cs = torch.cumsum(gaps.clamp(max=1 << 40) + 1, 0)
+    local = cs - 1 - (cs - (gaps + 1))[_exclusive_cumsum(counts)][elem_group]
+    bad |= (local >= size_g[elem_group]).any()
+    if bool(bad):
+        raise CorruptUpdate("payload does not decode to the declared changes")
+
+    # positions and new values per tensor; verify every checksum before writing anything
+    staged, lo, gi = [], 0, 0
+    for h, a, hist in zip(u.tensors, targets, hists):
+        n_t = sum(g.count for g in h.groups)
+        sl = slice(lo, lo + n_t)
+        ex = torch.repeat_interleave(torch.tensor([g.exponent for g in h.groups], device=dev),
+                                     counts[gi:gi + len(h.groups)])
+        if hist is None:
+            _, order, starts = _sorted_slab(a, 0)
+            if bool((local[sl] >= (starts[1:] - starts[:-1])[ex]).any()):
+                raise CorruptUpdate(f"{h.name}: position outside its exponent group")
+            idx = order[starts[ex] + local[sl]]
+        else:
+            idx = _positions(a, ex, local[sl], hist)
+        old_u = a[idx].long() & 0xFFFF
+        z = zz[sl]
+        new_u = (old_u + ((z >> 1) ^ -(z & 1))) & 0xFFFF
+        old_chk = checksums[h.name] if checksums is not None and h.name in checksums else checksum(a)
+        chk = (old_chk + int(((new_u - old_u) * _weights(idx)).sum())) & _MASK64
+        if chk != h.checksum:
+            raise CorruptUpdate(f"{h.name}: checksum mismatch after applying the update")
+        staged.append((a, idx, (new_u - ((new_u >> 15) << 16)).to(torch.int16)))
+        lo += n_t
+        gi += len(h.groups)
+    for a, idx, vals in staged:
+        a[idx] = vals
+    if checksums is not None:
+        checksums.update({h.name: h.checksum for h in u.tensors})
+    return total
