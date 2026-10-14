@@ -486,6 +486,18 @@ def _read64(W: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
     return (W[w] << s) | _lsr(W[w + 1], 64 - s)
 
 
+def _triton_decoder():
+    """The Triton block decoder if usable (CUDA + triton installed, not disabled), else None."""
+    import os
+    if os.environ.get("CRUKX_SYNC_NO_TRITON"):
+        return None
+    try:
+        from . import _triton
+    except ImportError:
+        return None
+    return _triton
+
+
 def _decode_blocks_fast(payload, blocks, tabs, total, dev):
     """All blocks in one vectorised loop of 256 steps, two 64-bit window reads per step."""
     cur, blk_end, blk_count, elem_base, rice, q_max, tbl = blocks
@@ -609,43 +621,88 @@ def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict | None
     total = int(counts.sum())
     blocks = (cur, blk_end, blk_count, elem_base, rice, q_max, tbl)
     tabs = (first, ncode, base, syms, lens)
-    gaps, zz, bad_dec, long_run = _decode_blocks_fast(u.payload, blocks, tabs, total, dev)
+    if dev.type == "cuda" and _triton_decoder() is not None:
+        gaps, zz, bad_dec, long_run = _triton_decoder().decode_blocks(_words64(u.payload, dev), blocks, tabs, total)
+    else:
+        gaps, zz, bad_dec, long_run = _decode_blocks_fast(u.payload, blocks, tabs, total, dev)
     if bool(long_run):  # a unary run longer than one 64-bit window: exact slow path
         gaps, zz, bad_dec = _decode_blocks_slow(u.payload, blocks, tabs, total, dev)
     bad = bad_dec
 
-    # per tensor: positions, new values, checksum delta. Validation flags and checksums are
-    # gathered as tensors and checked once at the end; nothing is written until all pass.
-    staged, lo, gi, deltas, expected = [], 0, 0, [], []
-    for h, a, hist in zip(u.tensors, targets, hists):
-        n_t = sum(x.count for x in h.groups)
-        g_cnt = counts[gi:gi + len(h.groups)]
-        g = gaps[lo:lo + n_t]
-        ex = torch.repeat_interleave(torch.tensor([x.exponent for x in h.groups], device=dev), g_cnt)
-        grp = torch.repeat_interleave(torch.arange(len(h.groups), device=dev), g_cnt)
+    # all elements at once: group, tensor and group-local index of every change
+    g_tensor = torch.repeat_interleave(torch.arange(len(u.tensors), device=dev),
+                                       torch.tensor([len(h.groups) for h in u.tensors], device=dev))
+    g_exp = torch.tensor([x.exponent for h in u.tensors for x in h.groups], device=dev)
+    elem_group = torch.repeat_interleave(torch.arange(len(g_count), device=dev), counts)
+    g1 = gaps.clamp(max=1 << 40) + 1
+    cs = torch.cumsum(g1, 0)
+    local = cs - 1 - (cs - g1)[_exclusive_cumsum(counts)][elem_group]
+    t_count = [sum(x.count for x in h.groups) for h in u.tensors]
+    t_lo = [0]
+    for n in t_count:
+        t_lo.append(t_lo[-1] + n)
+    size_g = torch.zeros(len(g_count), dtype=torch.long, device=dev)
+    idx = torch.zeros(total, dtype=torch.long, device=dev)
+    old_u = torch.zeros(total, dtype=torch.long, device=dev)
+    g_lo = [0]
+    for h in u.tensors:
+        g_lo.append(g_lo[-1] + len(h.groups))
+
+    # small tensors: one shared sort per batch on (tensor, exponent) keys
+    small = _small_batches([a.numel() if hist is None else _SMALL_TENSOR + 1
+                            for a, hist in zip(targets, hists)])
+    for grp in small:
+        A = torch.cat([targets[t] for t in grp])
+        sizes = [targets[t].numel() for t in grp]
+        offs = torch.tensor([0] + sizes, device=dev).cumsum(0)
+        seg_all = torch.repeat_interleave(torch.arange(len(grp), dtype=torch.int16, device=dev),
+                                          torch.tensor(sizes, device=dev))
+        key = (seg_all << 8) | ((A >> 7) & 0xFF)
+        order = torch.argsort(key, stable=True)
+        starts = torch.searchsorted(key[order], torch.arange(len(grp) * 256 + 1, dtype=key.dtype, device=dev))
+        gsel = torch.cat([torch.arange(g_lo[t], g_lo[t + 1], device=dev) for t in grp])
+        gseg = torch.repeat_interleave(torch.arange(len(grp), device=dev),
+                                       torch.tensor([g_lo[t + 1] - g_lo[t] for t in grp], device=dev))
+        gkey = (gseg << 8) | g_exp[gsel]
+        size_g[gsel] = starts[gkey + 1] - starts[gkey]
+        esel = torch.cat([torch.arange(t_lo[t], t_lo[t + 1], device=dev) for t in grp])
+        ekey = gkey[torch.searchsorted(gsel, elem_group[esel])]
+        loc = torch.minimum(local[esel], (starts[ekey + 1] - starts[ekey] - 1).clamp(min=0))
+        p = order[(starts[ekey] + loc).clamp(max=order.numel() - 1)]
+        old_u[esel] = A[p].long() & 0xFFFF
+        idx[esel] = p - offs[ekey >> 8]
+
+    # large tensors: slab sorts per tensor
+    in_small = {t for grp in small for t in grp}
+    for t, (a, hist) in enumerate(zip(targets, hists)):
+        if t in in_small:
+            continue
+        sl = slice(t_lo[t], t_lo[t + 1])
+        gs = slice(g_lo[t], g_lo[t + 1])
+        ex = g_exp[elem_group[sl]]
         if hist is None:
             _, order, starts = _sorted_slab(a, 0)
-            size = (starts[1:] - starts[:-1])[ex]
+            size_g[gs] = (starts[1:] - starts[:-1])[g_exp[gs]]
         else:
-            size = hist.sum(0)[ex]
-        bad |= (g >= size).any()
-        cs = torch.cumsum(g.clamp(max=1 << 40) + 1, 0)
-        local = cs - 1 - (cs - (g.clamp(max=1 << 40) + 1))[_exclusive_cumsum(g_cnt)][grp]
-        bad |= (local >= size).any()
-        local = torch.minimum(local, size - 1)  # keep gathers in range; `bad` already flags it
-        idx = order[starts[ex] + local] if hist is None else _positions(a, ex, local, hist)
-        old_u = a[idx].long() & 0xFFFF
-        z = zz[lo:lo + n_t]
-        new_u = (old_u + ((z >> 1) ^ -(z & 1))) & 0xFFFF
+            size_g[gs] = hist.sum(0)[g_exp[gs]]
+        loc = torch.minimum(local[sl], (size_g[elem_group[sl]] - 1).clamp(min=0))
+        p = order[starts[ex] + loc] if hist is None else _positions(a, ex, loc, hist)
+        idx[sl] = p
+        old_u[sl] = a[p].long() & 0xFFFF
+
+    size_e = size_g[elem_group]
+    bad |= (gaps >= size_e).any() | (local >= size_e).any()
+    new_u = (old_u + ((zz >> 1) ^ -(zz & 1))) & 0xFFFF
+    t_cnt = torch.tensor(t_count, device=dev)
+    t_delta = _segment_sum((new_u - old_u) * _weights(idx), t_cnt)
+    deltas, expected = [], []
+    for t, h in enumerate(u.tensors):
         old_chk = _cache_get(checksums, h.name, weights[h.name])
-        if old_chk is None:
-            old_chk = checksum(a)
-        deltas.append(((new_u - old_u) * _weights(idx)).sum() + _i64(old_chk))
+        deltas.append(_i64(old_chk if old_chk is not None else checksum(targets[t])))
         expected.append(_i64(h.checksum))
-        staged.append((a, idx, (new_u - ((new_u >> 15) << 16)).to(torch.int16)))
-        lo += n_t
-        gi += len(h.groups)
-    ok = torch.stack(deltas) == torch.tensor(expected, dtype=torch.long, device=dev)
+    vals = (new_u - ((new_u >> 15) << 16)).to(torch.int16)
+    staged = [(a, idx[t_lo[t]:t_lo[t + 1]], vals[t_lo[t]:t_lo[t + 1]]) for t, a in enumerate(targets)]
+    ok = (torch.tensor(deltas, dtype=torch.long, device=dev) + t_delta) == torch.tensor(expected, dtype=torch.long, device=dev)
     if bool(bad) or not bool(ok.all()):  # one sync for the whole update
         names = [h.name for h, good in zip(u.tensors, ok.tolist()) if not good]
         raise CorruptUpdate(f"update does not verify (checksum mismatch: {names[:3]})" if names

@@ -265,3 +265,23 @@ def test_long_unary_run_takes_the_exact_slow_path(dev):
     upd, _ = roundtrip({"w": a}, {"w": b})
     from crukx_sync.wire import parse
     assert parse(upd).tensors[0].groups[0].rice_r < 10  # so the long gap's unary run is >> 64 bits
+
+
+def test_triton_decoder_matches_torch_decoder(monkeypatch):
+    if "cuda" not in DEVICES:
+        pytest.skip("no GPU")
+    import crukx_sync.codec as codec
+    if codec._triton_decoder() is None:
+        pytest.skip("triton not available")
+    g = torch.Generator().manual_seed(11)
+    old = {f"t{i}": (torch.randn(n, generator=g) * 0.02).bfloat16().cuda() for i, n in enumerate([5000, 300_000, 77])}
+    new = {k: (v.float() + 3e-5 * torch.randn(v.shape, generator=g).cuda()).bfloat16() for k, v in old.items()}
+    upd = encode_update(old, new)
+    a = {k: v.clone() for k, v in old.items()}
+    apply_update(a, upd)
+    monkeypatch.setenv("CRUKX_SYNC_NO_TRITON", "1")
+    b = {k: v.clone() for k, v in old.items()}
+    apply_update(b, upd)
+    for k in new:
+        assert torch.equal(a[k].view(torch.int16), b[k].view(torch.int16))
+        assert torch.equal(a[k].view(torch.int16), new[k].view(torch.int16))
