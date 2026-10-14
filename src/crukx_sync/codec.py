@@ -147,6 +147,53 @@ def _changed_ranks(a: torch.Tensor, m: torch.Tensor):
     return ex[key], rank[key], src[key]
 
 
+_SMALL_TENSOR = 1 << 22  # tensors up to this size are ranked together with others
+_MAX_SEGS = 127          # tensors per shared sort: (tensor, exponent) keys still fit int16
+
+
+def _small_batches(sizes: list[int]) -> list[list[int]]:
+    """Indices of small tensors grouped so each group fits one slab and an int16 key."""
+    groups, cur, total = [], [], 0
+    for i, n in enumerate(sizes):
+        if n > _SMALL_TENSOR:
+            continue
+        if cur and (total + n > _SLAB or len(cur) == _MAX_SEGS):
+            groups.append(cur)
+            cur, total = [], 0
+        cur.append(i)
+        total += n
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _changed_ranks_many(pairs: list[tuple[torch.Tensor, torch.Tensor]]):
+    """_changed_ranks for several small tensors with one sort on (tensor, exponent) keys.
+    Returns one (exponent, rank, position) triple per tensor."""
+    dev = pairs[0][0].device
+    sizes = [a.numel() for a, _ in pairs]
+    A = torch.cat([a for a, _ in pairs])
+    m = torch.cat([a != b for a, b in pairs])
+    seg = torch.repeat_interleave(torch.arange(len(pairs), dtype=torch.int16, device=dev),
+                                  torch.tensor(sizes, device=dev))
+    key = (seg << 8) | ((A >> 7) & 0xFF)
+    order = torch.argsort(key, stable=True)
+    ks = key[order]
+    starts = torch.searchsorted(ks, torch.arange(len(pairs) * 256 + 1, dtype=key.dtype, device=dev))
+    r = torch.nonzero(m[order]).flatten()
+    k = ks[r].long()
+    rank = r - starts[k]
+    src = order[r]
+    offs = torch.cumsum(torch.tensor([0] + sizes, device=dev), 0)
+    per = torch.bincount(k >> 8, minlength=len(pairs)).tolist()  # rows are seg-major already
+    out, lo = [], 0
+    for i, n in enumerate(per):
+        sl = slice(lo, lo + n)
+        out.append(((k[sl] & 255), rank[sl], src[sl] - offs[i]))
+        lo += n
+    return out
+
+
 def _positions(a: torch.Tensor, ex: torch.Tensor, rank: torch.Tensor, hists: torch.Tensor) -> torch.Tensor:
     """Inverse of _changed_ranks: element positions for (exponent, rank) pairs."""
     slab_before = _exclusive_cumsum(hists)                     # [n_slabs, 256]
@@ -163,14 +210,6 @@ def _positions(a: torch.Tensor, ex: torch.Tensor, rank: torch.Tensor, hists: tor
 
 
 # ---------------------------------------------------------------- encoder
-
-def _new_checksum(name, a, b, idx, checksums) -> int:
-    """Checksum of `b`: incremental from the cached checksum of `a` when available."""
-    if checksums is not None and name in checksums:
-        d = (b[idx].long() & 0xFFFF) - (a[idx].long() & 0xFFFF)
-        return (checksums[name] + int((d * _weights(idx)).sum())) & _MASK64
-    return checksum(b)
-
 
 _PACK_BATCH = 1 << 24  # changes packed at once (bounds encoder memory)
 _LONG = 62  # codes up to this many bits are written as one integer; longer ones bit by bit
@@ -255,63 +294,74 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
     dev = next(iter(pairs.values()))[0].device
     changed_any = torch.stack([(a != b).any() for a, b in pairs.values()]).tolist()  # one sync
 
-    # pass 1, per tensor: changes, groups; compact arrays kept for the later passes
-    names, numels, EX, GP, ZZ, GC, RICE = [], [], [], [], [], [], []
-    new_checksums = {}
-    dense = torch.zeros(256 * _SMALL, dtype=torch.long, device=dev)
-    rare = []
-    for (name, (a, b)), any_change in zip(pairs.items(), changed_any):
-        if not any_change:
-            continue
-        ex, local, src = _changed_ranks(a, a != b)
-        first = torch.ones_like(ex, dtype=torch.bool)
-        first[1:] = ex[1:] != ex[:-1]
+    # pass 1: rank changes (small tensors share sorts), then do the bookkeeping per batch of
+    # tensors with at most _PACK_BATCH changes: few kernel launches, bounded memory
+    todo = [(name, a, b) for (name, (a, b)), c in zip(pairs.items(), changed_any) if c]
+    if not todo:
+        return Update([], []), {}
+    ranked = {}
+    for grp in _small_batches([a.numel() for _, a, _ in todo]):
+        for i, r in zip(grp, _changed_ranks_many([(todo[i][1], todo[i][2]) for i in grp])):
+            ranked[i] = r
+    batches, pending, pend_n, chk_parts = [], [], 0, []
+
+    def flush():
+        n_t = [len(p[3]) for p in pending]
+        cnt_t = torch.tensor(n_t, device=dev)
+        seg = torch.repeat_interleave(torch.arange(len(pending), device=dev), cnt_t)
+        ex = torch.cat([p[3] for p in pending]).long()
+        local = torch.cat([p[4] for p in pending])
+        src = torch.cat([p[5] for p in pending])
+        va = torch.cat([p[6] for p in pending]).long()
+        vb = torch.cat([p[7] for p in pending]).long()
+        key = (seg << 8) | ex
+        first = torch.ones_like(key, dtype=torch.bool)
+        first[1:] = key[1:] != key[:-1]
         prev = torch.roll(local, 1)
         prev[first] = -1
-        res = b[src].long() - a[src].long()
-        exps, counts = torch.unique_consecutive(ex, return_counts=True)
-        gaps = local - prev - 1
-        zz = (res << 1) ^ (res >> 63)
-        new_checksums[name] = _new_checksum(name, a, b, src, checksums)
-        names.append(name)
-        numels.append(a.numel())
-        EX.append(ex.to(torch.int16))  # compact copies for pass 3
-        GP.append(gaps.to(torch.int32) if a.numel() < 1 << 31 else gaps)
-        ZZ.append(zz.to(torch.int32))
-        GC.append((exps, counts))
-    if not names:
-        return Update([], []), {}
+        res = vb - va
+        gkeys, gcnt = torch.unique_consecutive(key, return_counts=True)
+        # checksum deltas of all tensors in the batch: one segment sum
+        delta = _segment_sum(((vb & 0xFFFF) - (va & 0xFFFF)) * _weights(src), cnt_t)
+        chk_parts.append(([p[0] for p in pending], delta))
+        batches.append({
+            "names": [p[0] for p in pending], "numels": [p[1] for p in pending],
+            "ex": ex.to(torch.int16), "gaps": (local - prev - 1).to(torch.int32),
+            "zz": ((res << 1) ^ (res >> 63)).to(torch.int32),
+            "g_exp": gkeys & 255, "g_cnt": gcnt,
+            "groups_per_tensor": torch.bincount(gkeys >> 8, minlength=len(pending)),
+        })
 
-    # group tables for the whole update (one sync)
-    g_exp = torch.cat([e for e, _ in GC])
-    g_cnt = torch.cat([c for _, c in GC])
-    n_per_tensor = [len(c) for _, c in GC]
-    gid = torch.repeat_interleave(torch.arange(g_cnt.numel(), device=dev), g_cnt)
-    elem_first = _exclusive_cumsum(g_cnt)
+    for i, (name, a, b) in enumerate(todo):
+        ex, local, src = ranked[i] if i in ranked else _changed_ranks(a, a != b)
+        if pending and pend_n + ex.numel() > _PACK_BATCH:
+            flush()
+            pending, pend_n = [], 0
+        pending.append((name, a.numel(), b, ex, local, src, a[src], b[src]))
+        pend_n += ex.numel()
+    flush()
 
-    # batches of whole tensors with at most _PACK_BATCH changes (memory bound for passes 2-3)
-    batches, t = [], 0
-    while t < len(names):
-        t1, n = t, 0
-        while t1 < len(names) and (t1 == t or n + EX[t1].numel() <= _PACK_BATCH):
-            n += EX[t1].numel()
-            t1 += 1
-        batches.append((t, t1, n))
-        t = t1
-    g_lo = [0]
-    for k in n_per_tensor:
-        g_lo.append(g_lo[-1] + k)
+    # checksums: incremental from the cache when present, else a full pass (first update only)
+    new_checksums = {}
+    for names_b, delta in chk_parts:
+        for name, d in zip(names_b, delta.tolist()):
+            new_checksums[name] = ((checksums[name] + d) & _MASK64 if checksums is not None
+                                   and name in checksums else None)
+    for name, a, b in todo:
+        if new_checksums[name] is None:
+            new_checksums[name] = checksum(b)
 
     # per batch: Rice parameters and residual symbol counts
-    for t, t1, n in batches:
-        cnt = g_cnt[g_lo[t]:g_lo[t1]]
-        bgid = torch.repeat_interleave(torch.arange(cnt.numel(), device=dev), cnt)
-        RICE.append(_rice_params(torch.cat(GP[t:t1]).long(), bgid, cnt))
-        ex, zz = torch.cat(EX[t:t1]).long(), torch.cat(ZZ[t:t1]).long()
+    dense = torch.zeros(256 * _SMALL, dtype=torch.long, device=dev)
+    rare = []
+    for bt in batches:
+        cnt = bt["g_cnt"]
+        bt["gid"] = torch.repeat_interleave(torch.arange(cnt.numel(), device=dev), cnt)
+        bt["rice"] = _rice_params(bt["gaps"].long(), bt["gid"], cnt)
+        ex, zz = bt["ex"].long(), bt["zz"].long()
         small = zz < _SMALL
         dense += torch.bincount(ex[small] * _SMALL + zz[small], minlength=256 * _SMALL)
         rare.append(ex[~small] * _SYM_SPACE + zz[~small])
-    rice_g = torch.cat(RICE)
 
     # pass 2: one Huffman table per exponent for the whole update
     nz = torch.nonzero(dense).flatten()
@@ -338,25 +388,17 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
     code_t = torch.tensor(code_of, dtype=torch.long, device=dev)
     len_t = torch.tensor(len_of, dtype=torch.long, device=dev)
 
-    # headers (one sync for all group values)
-    exps_l, cnt_l, rice_l = g_exp.tolist(), g_cnt.tolist(), rice_g.tolist()
-    headers, gi = [], 0
-    for name, numel, k in zip(names, numels, n_per_tensor):
-        headers.append(TensorHeader(name, numel, new_checksums[name],
-                                    [Group(exps_l[j], cnt_l[j], rice_l[j]) for j in range(gi, gi + k)]))
-        gi += k
-
-    # pass 3: write bits in batches of tensors; batches join mid-byte, so carry the bit offset
-    nb_g = (g_cnt + BLOCK - 1) // BLOCK
-    payload, carry, bb_parts = bytearray(), 0, []
-    for t, t1, n in batches:
-        gi0, g1 = g_lo[t], g_lo[t1]
-        ex = torch.cat(EX[t:t1]).long()
-        zz = torch.cat(ZZ[t:t1]).long()
-        G = torch.cat(GP[t:t1]).long()
-        bgid = gid[elem_first[gi0]:elem_first[gi0] + n]
-        inv = torch.searchsorted(keys_t, ex * _SYM_SPACE + zz)
-        data, L = _pack_bits(G, rice_g[bgid], code_t[inv], len_t[inv], carry)
+    # headers and pass 3: write bits per batch; batches join mid-byte, so carry the bit offset
+    headers, payload, carry, bb_parts = [], bytearray(), 0, []
+    for bt in batches:
+        exps_l, cnt_l, rice_l = bt["g_exp"].tolist(), bt["g_cnt"].tolist(), bt["rice"].tolist()
+        gi = 0
+        for name, numel, k in zip(bt["names"], bt["numels"], bt["groups_per_tensor"].tolist()):
+            headers.append(TensorHeader(name, numel, new_checksums[name],
+                                        [Group(exps_l[j], cnt_l[j], rice_l[j]) for j in range(gi, gi + k)]))
+            gi += k
+        inv = torch.searchsorted(keys_t, bt["ex"].long() * _SYM_SPACE + bt["zz"].long())
+        data, L = _pack_bits(bt["gaps"].long(), bt["rice"][bt["gid"]], code_t[inv], len_t[inv], carry)
         if carry:
             payload[-1] |= data[0]
             payload += data[1:]
@@ -364,11 +406,11 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
             payload += data
         carry = (carry + int(L.sum())) % 8
         # blocks are consecutive runs of elements: block sizes are segment sums of L
-        cnt_b = g_cnt[gi0:g1]
-        blk_g = torch.repeat_interleave(torch.arange(g1 - gi0, device=dev), nb_g[gi0:g1])
-        blk_k = torch.arange(blk_g.numel(), device=dev) - _exclusive_cumsum(nb_g[gi0:g1])[blk_g]
-        blk_n = torch.clamp(cnt_b[blk_g] - blk_k * BLOCK, max=BLOCK)
-        bb_parts.append(_segment_sum(L, blk_n))
+        cnt = bt["g_cnt"]
+        nb = (cnt + BLOCK - 1) // BLOCK
+        blk_g = torch.repeat_interleave(torch.arange(cnt.numel(), device=dev), nb)
+        blk_k = torch.arange(blk_g.numel(), device=dev) - _exclusive_cumsum(nb)[blk_g]
+        bb_parts.append(_segment_sum(L, torch.clamp(cnt[blk_g] - blk_k * BLOCK, max=BLOCK)))
     block_bits = torch.cat(bb_parts)
     if int(block_bits.max()) >= 1 << 32:
         raise ValueError("a block exceeds 2^32 bits; the update cannot be represented")
