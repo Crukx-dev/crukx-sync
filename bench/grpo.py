@@ -31,12 +31,19 @@ opts = {n: torch.optim.AdamW([m], lr=LR, betas=(0.9, 0.95), weight_decay=0.0) fo
 total = sum(p.numel() for p in policy.parameters())
 
 
+TASK = os.environ.get("CRUKX_BENCH_TASK", "add")  # "mul" for models that solve "add" every time
+
+
 def task():
     # mixed difficulty so most groups contain both right and wrong answers
-    a, b = random.randint(10, 999), random.randint(10, 999)
-    q = f"What is {a} + {b}? Reply with only the number."
+    if TASK == "mul":
+        a, b = random.randint(100, 999), random.randint(10, 99)
+        q, ans = f"What is {a} * {b}? Reply with only the number.", a * b
+    else:
+        a, b = random.randint(10, 999), random.randint(10, 999)
+        q, ans = f"What is {a} + {b}? Reply with only the number.", a + b
     text = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True)
-    return text, a + b
+    return text, ans
 
 
 def reward(out, ans):
@@ -56,6 +63,7 @@ for step in range(1, STEPS + 1):
     tasks = [task() for _ in range(PROMPTS)]
     texts = [t for t, _ in tasks for _ in range(GROUP)]
     enc = tok(texts, return_tensors="pt", padding=True).to("cuda")
+    tg = time.time()
     policy.eval()
     with torch.no_grad():
         gen = policy.generate(**enc, max_new_tokens=MAX_NEW, do_sample=True, temperature=1.0, top_p=1.0,
@@ -66,7 +74,9 @@ for step in range(1, STEPS + 1):
     rg = r.view(PROMPTS, GROUP)
     adv = ((rg - rg.mean(1, keepdim=True)) / (rg.std(1, keepdim=True) + 1e-4)).flatten().cuda()
     # GRPO loss on completion tokens
+    gen_s = time.time() - tg
     policy.train()
+    tb = time.time()
     attn = (gen != tok.pad_token_id).long()
     attn[:, :enc.input_ids.shape[1]] = enc.attention_mask
     logits = policy(input_ids=gen, attention_mask=attn).logits[:, enc.input_ids.shape[1] - 1:-1].float()
@@ -75,17 +85,19 @@ for step in range(1, STEPS + 1):
     seq_lp = (lp * cmask).sum(1) / cmask.sum(1).clamp(min=1)
     loss = -(adv * seq_lp).mean()
     loss.backward()
+    torch.cuda.synchronize(); bwd_s = time.time() - tb; to = time.time()
     for n, p in policy.named_parameters():
         master[n].grad = p.grad.detach().float().cpu()
         p.grad = None
         opts[n].step()
         master[n].grad = None
+    opt_s = time.time() - to
     with torch.no_grad():
         for n, p in policy.named_parameters():
             p.copy_(master[n].to(torch.bfloat16))
     cur = bf16_state()
     row = {"step": step, "reward": round(r.mean().item(), 3), "loss": round(loss.item(), 4),
-           "step_s": round(time.time() - t0, 1)}
+           "step_s": round(time.time() - t0, 1), "gen_s": round(gen_s, 1), "bwd_s": round(bwd_s, 1), "opt_s": round(opt_s, 1)}
     torch.cuda.synchronize(); t1 = time.time(); upd = encode_update(prev, cur, send_chk); torch.cuda.synchronize(); enc_s = time.time() - t1
     recv = prev  # the receiver's own tensors, updated in place every step
     t1 = time.time(); stats = apply_update(recv, upd, recv_chk); torch.cuda.synchronize(); dec_s = time.time() - t1

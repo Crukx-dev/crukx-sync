@@ -172,93 +172,15 @@ def _new_checksum(name, a, b, idx, checksums) -> int:
     return checksum(b)
 
 
-def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
-           checksums: dict[str, int] | None = None) -> tuple[Update, dict[str, int]]:
-    """The update, and the new checksums for the caller to commit once the update is serialized."""
-    headers, E, G, Z, group_counts = [], [], [], [], []
-    new_checksums = {}
-    pairs = {}
-    for name in old:
-        a, b = bits16(name, old[name]), bits16(name, new[name])
-        if a.shape != b.shape:
-            raise ValueError(f"{name}: old and new differ in shape")
-        pairs[name] = (a, b)
-    if not pairs:
-        return Update([], []), {}
-    if len({t.device for ab in pairs.values() for t in ab}) != 1:
-        raise ValueError("all tensors must be on one device")
-    changed_any = torch.stack([(a != b).any() for a, b in pairs.values()]).tolist()  # one sync
-    for (name, (a, b)), any_change in zip(pairs.items(), changed_any):
-        if not any_change:
-            continue
-        m = a != b
-        ex, local, src = _changed_ranks(a, m)
-        first = torch.ones_like(ex, dtype=torch.bool)
-        first[1:] = ex[1:] != ex[:-1]
-        prev = torch.roll(local, 1)
-        prev[first] = -1
-        res = b[src].long() - a[src].long()
-        exps, counts = torch.unique_consecutive(ex, return_counts=True)
-        chk = new_checksums[name] = _new_checksum(name, a, b, src, checksums)
-        headers.append(TensorHeader(name, a.numel(), chk,
-                                    [Group(int(x), int(c), 0) for x, c in zip(exps.tolist(), counts.tolist())]))
-        E.append(ex)
-        G.append(local - prev - 1)
-        Z.append((res << 1) ^ (res >> 63))
-        group_counts += counts.tolist()
-    if not headers:
-        return Update([], []), {}
-    E, G, Z = torch.cat(E), torch.cat(G), torch.cat(Z)
-    dev, n = E.device, E.numel()
-    counts = torch.tensor(group_counts, dtype=torch.long, device=dev)
-    gid = torch.repeat_interleave(torch.arange(len(group_counts), device=dev), counts)
-
-    # Rice parameter per group: cheapest total length
-    costs = torch.stack([torch.zeros(len(group_counts), dtype=torch.long, device=dev)
-                         .scatter_add_(0, gid, (G >> r) + 1 + r) for r in range(MAX_RICE + 1)])
-    rice_g = costs.argmin(0)
-    R = rice_g[gid]
-
-    # Huffman table per exponent, shared by the whole update
-    # count (exponent, symbol) pairs: dense bincount for small symbols, unique() for the rare rest
-    key = E * _SYM_SPACE + Z
-    small = Z < _SMALL
-    dense = torch.bincount(E[small] * _SMALL + Z[small], minlength=256 * _SMALL)
-    nz = torch.nonzero(dense).flatten()
-    rare_keys, rare_counts = torch.unique(key[~small], return_counts=True)
-    keys = torch.cat([(nz // _SMALL) * _SYM_SPACE + nz % _SMALL, rare_keys])
-    kcount = torch.cat([dense[nz], rare_counts])
-    srt = torch.argsort(keys)
-    keys, kcount = keys[srt], kcount[srt]
-    inv = torch.searchsorted(keys, key)
-    keys, kcount = keys.tolist(), kcount.tolist()
-    code_of, len_of, tables, lo = [0] * len(keys), [0] * len(keys), [], 0
-    while lo < len(keys):
-        exp = keys[lo] // _SYM_SPACE
-        hi = lo
-        while hi < len(keys) and keys[hi] // _SYM_SPACE == exp:
-            hi += 1
-        lengths = huffman_lengths(kcount[lo:hi])
-        code_of[lo:hi], len_of[lo:hi] = canonical_codes(lengths), lengths
-        tables.append(Table(exp, [k % _SYM_SPACE for k in keys[lo:hi]], lengths))
-        lo = hi
-    HC = torch.tensor(code_of, dtype=torch.long, device=dev)[inv]
-    HL = torch.tensor(len_of, dtype=torch.long, device=dev)[inv]
-
-    # bit lengths, blocks
+def _pack_bits(G, R, HC, HL, carry: int):
+    """Bitstream for one tensor's changes (Rice gap then Huffman code per element), starting at
+    bit offset `carry` (0-7) inside its first byte. Returns (bytes, per-element bit lengths)."""
+    dev = G.device
     q = G >> R
     Lr = q + 1 + R
     L = Lr + HL
-    start = _exclusive_cumsum(L)
-    total_bits = int(L.sum())
-    k_in_group = torch.arange(n, device=dev) - _exclusive_cumsum(counts)[gid]
-    blocks_per_group = (counts + BLOCK - 1) // BLOCK
-    bid = _exclusive_cumsum(blocks_per_group)[gid] + k_in_group // BLOCK
-    block_bits = torch.zeros(int(blocks_per_group.sum()), dtype=torch.long, device=dev).scatter_add_(0, bid, L)
-    if int(block_bits.max()) >= 1 << 32:
-        raise ValueError("a block exceeds 2^32 bits; the update cannot be represented")
-
-    # set bits: unary ones, Rice remainder (MSB first), Huffman code (MSB first)
+    start = _exclusive_cumsum(L) + carry
+    total_bits = carry + int(L.sum())
     ones = [torch.repeat_interleave(start, q)
             + torch.arange(int(q.sum()), device=dev) - torch.repeat_interleave(_exclusive_cumsum(q), q)]
     for j in range(int(R.max()) + 1):
@@ -270,16 +192,105 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
     pos = torch.cat(ones)
     words = torch.zeros(total_bits // 32 + 1, dtype=torch.long, device=dev)
     words.scatter_add_(0, pos >> 5, torch.ones_like(pos) << (31 - (pos & 31)))
-    payload = torch.stack([(words >> s) & 0xFF for s in (24, 16, 8, 0)], 1).flatten()
-    payload = payload[: (total_bits + 7) // 8].to(torch.uint8).cpu().numpy().tobytes()
+    data = torch.stack([(words >> s) & 0xFF for s in (24, 16, 8, 0)], 1).flatten()
+    return data[: (total_bits + 7) // 8].to(torch.uint8).cpu().numpy().tobytes(), L
 
-    rice_list = rice_g.tolist()
-    gi = 0
-    for h in headers:
-        for g in h.groups:
-            g.rice_r = rice_list[gi]
-            gi += 1
-    return Update(tables, headers, block_bits.tolist(), payload), new_checksums
+
+def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
+           checksums: dict[str, int] | None = None) -> tuple[Update, dict[str, int]]:
+    """The update, and the new checksums for the caller to commit once the update is serialized.
+
+    Works one tensor at a time (find changes, then write bits), so GPU memory is bounded by the
+    largest tensor's changes, not the whole update's."""
+    pairs = {}
+    for name in old:
+        a, b = bits16(name, old[name]), bits16(name, new[name])
+        if a.shape != b.shape:
+            raise ValueError(f"{name}: old and new differ in shape")
+        pairs[name] = (a, b)
+    if not pairs:
+        return Update([], []), {}
+    if len({t.device for ab in pairs.values() for t in ab}) != 1:
+        raise ValueError("all tensors must be on one device")
+    dev = next(iter(pairs.values()))[0].device
+    changed_any = torch.stack([(a != b).any() for a, b in pairs.values()]).tolist()  # one sync
+
+    # pass 1, per tensor: changes, groups, Rice parameters, symbol counts; keep compact arrays
+    headers, kept, new_checksums = [], [], {}
+    dense = torch.zeros(256 * _SMALL, dtype=torch.long, device=dev)
+    rare = []
+    for (name, (a, b)), any_change in zip(pairs.items(), changed_any):
+        if not any_change:
+            continue
+        ex, local, src = _changed_ranks(a, a != b)
+        first = torch.ones_like(ex, dtype=torch.bool)
+        first[1:] = ex[1:] != ex[:-1]
+        prev = torch.roll(local, 1)
+        prev[first] = -1
+        gaps = local - prev - 1
+        res = b[src].long() - a[src].long()
+        zz = (res << 1) ^ (res >> 63)
+        exps, counts = torch.unique_consecutive(ex, return_counts=True)
+        gid = torch.repeat_interleave(torch.arange(len(counts), device=dev), counts)
+        costs = torch.stack([torch.zeros(len(counts), dtype=torch.long, device=dev)
+                             .scatter_add_(0, gid, (gaps >> r) + 1 + r) for r in range(MAX_RICE + 1)])
+        rice = costs.argmin(0)
+        small = zz < _SMALL
+        dense += torch.bincount(ex[small] * _SMALL + zz[small], minlength=256 * _SMALL)
+        if not bool(small.all()):
+            rare.append(ex[~small] * _SYM_SPACE + zz[~small])
+        new_checksums[name] = _new_checksum(name, a, b, src, checksums)
+        headers.append(TensorHeader(name, a.numel(), new_checksums[name],
+                                    [Group(int(x), int(c), int(r)) for x, c, r in
+                                     zip(exps.tolist(), counts.tolist(), rice.tolist())]))
+        # compact copies for pass 3 (exponent fits int16, zigzag symbol fits int32)
+        kept.append((ex.to(torch.int16), gaps, zz.to(torch.int32), rice[gid].to(torch.int8), counts))
+    if not headers:
+        return Update([], []), {}
+
+    # pass 2: one Huffman table per exponent for the whole update
+    nz = torch.nonzero(dense).flatten()
+    keys = (nz // _SMALL) * _SYM_SPACE + nz % _SMALL
+    kcount = dense[nz]
+    if rare:
+        rk, rc = torch.unique(torch.cat(rare), return_counts=True)
+        keys, kcount = torch.cat([keys, rk]), torch.cat([kcount, rc])
+    srt = torch.argsort(keys)
+    keys_t = keys[srt]
+    keys, kcount = keys_t.tolist(), kcount[srt].tolist()
+    code_of, len_of, tables, lo = [0] * len(keys), [0] * len(keys), [], 0
+    while lo < len(keys):
+        exp = keys[lo] // _SYM_SPACE
+        hi = lo
+        while hi < len(keys) and keys[hi] // _SYM_SPACE == exp:
+            hi += 1
+        lengths = huffman_lengths(kcount[lo:hi])
+        code_of[lo:hi], len_of[lo:hi] = canonical_codes(lengths), lengths
+        tables.append(Table(exp, [k % _SYM_SPACE for k in keys[lo:hi]], lengths))
+        lo = hi
+    code_t = torch.tensor(code_of, dtype=torch.long, device=dev)
+    len_t = torch.tensor(len_of, dtype=torch.long, device=dev)
+
+    # pass 3, per tensor: write bits; tensors join mid-byte, so carry the bit offset across
+    payload, carry, block_bits = bytearray(), 0, []
+    for ex, gaps, zz, rice_e, counts in kept:
+        inv = torch.searchsorted(keys_t, ex.long() * _SYM_SPACE + zz.long())
+        data, L = _pack_bits(gaps, rice_e.long(), code_t[inv], len_t[inv], carry)
+        if carry:
+            payload[-1] |= data[0]
+            payload += data[1:]
+        else:
+            payload += data
+        carry = (carry + int(L.sum())) % 8
+        gid = torch.repeat_interleave(torch.arange(len(counts), device=dev), counts)
+        k_in_group = torch.arange(L.numel(), device=dev) - _exclusive_cumsum(counts)[gid]
+        nb = (counts + BLOCK - 1) // BLOCK
+        bid = _exclusive_cumsum(nb)[gid] + k_in_group // BLOCK
+        bb = torch.zeros(int(nb.sum()), dtype=torch.long, device=dev).scatter_add_(0, bid, L)
+        if int(bb.max()) >= 1 << 32:
+            raise ValueError("a block exceeds 2^32 bits; the update cannot be represented")
+        block_bits += bb.tolist()
+    return Update(tables, headers, block_bits, bytes(payload)), new_checksums
 
 
 # ---------------------------------------------------------------- decoder
