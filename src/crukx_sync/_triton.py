@@ -51,14 +51,15 @@ def _decode_kernel(W, n_words, cur_p, end_p, count_p, base_p, rice_p, qmax_p, tb
         bad = tl.where(act & (cur >= end), 1, bad)
         y = ~_read64(W, n_words, cur)
         q = libdevice.clz(y.to(tl.int64)).to(tl.int64)
-        # unary runs longer than one window: keep reading windows (bounded by qmax: a run longer
-        # than the group allows is corrupt and stops here)
-        need = act & (y == 0) & (q <= qmax)
+        # unary runs longer than one window: keep reading windows, but never past this block's
+        # own end (and never past qmax). Each lane then scans at most its own block's bits, so the
+        # total work is linear in the payload even for hostile updates.
+        need = act & (y == 0) & (q <= qmax) & (cur + q < end)
         while tl.max(need.to(tl.int32), axis=0) > 0:
             y = ~_read64(W, n_words, cur + q)
             q = tl.where(need, q + libdevice.clz(y.to(tl.int64)).to(tl.int64), q)
-            need = need & (y == 0) & (q <= qmax)
-        bad = tl.where(act & (q > qmax), 1, bad)
+            need = need & (y == 0) & (q <= qmax) & (cur + q < end)
+        bad = tl.where(act & ((q > qmax) | (cur + q >= end)), 1, bad)
         c = cur + q + 1
         x = _read64(W, n_words, c)
         rem = tl.where(rice_u == 0, tl.zeros_like(x), x >> (64 - rice_u))

@@ -285,3 +285,34 @@ def test_triton_decoder_matches_torch_decoder(monkeypatch):
     for k in new:
         assert torch.equal(a[k].view(torch.int16), b[k].view(torch.int16))
         assert torch.equal(a[k].view(torch.int16), new[k].view(torch.int16))
+
+
+def test_hostile_long_unary_runs_finish_quickly():
+    """Many tiny blocks over one long run of one-bits must be rejected in linear time."""
+    if "cuda" not in DEVICES:
+        pytest.skip("no GPU")
+    import time
+    from crukx_sync.wire import write_varint
+    n = 1 << 20
+    a = torch.full((n,), 0x3F80, dtype=torch.int16, device="cuda")
+    count = 1 << 18                          # 1024 blocks of 256 changes
+    payload = b"\xff" * (count * 2 // 8)     # every block "uses" its minimum 2 bits/change, all ones
+    out = bytearray(b"CRXS\x02")
+    write_varint(out, 1)
+    out += b"\x7f\x01\x02\x01"               # table: exponent 127, symbol 2, length 1
+    write_varint(out, 1)
+    write_varint(out, 1)
+    out += b"w"
+    write_varint(out, n)
+    out += bytes(8)
+    write_varint(out, 1)
+    out += b"\x7f"
+    write_varint(out, count)
+    out += b"\x00"                            # rice 0
+    out += (512).to_bytes(4, "little") * (count // 256)
+    write_varint(out, len(payload))
+    out += payload
+    t = time.time()
+    with pytest.raises(CorruptUpdate):
+        apply_update({"w": a.clone()}, bytes(out))
+    assert time.time() - t < 30
