@@ -25,7 +25,9 @@ policy = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
 policy.gradient_checkpointing_enable()
 names = [n for n, _ in policy.named_parameters()]
 master = {n: p.detach().float().cpu().clone().requires_grad_(False) for n, p in policy.named_parameters()}
-opt = torch.optim.AdamW(list(master.values()), lr=LR, betas=(0.9, 0.95), weight_decay=0.0)
+# one AdamW per tensor, stepped as each gradient arrives: only one fp32 gradient is ever in host
+# RAM (7B: ~91 GB master + Adam states instead of ~121 GB); same maths as a single optimizer
+opts = {n: torch.optim.AdamW([m], lr=LR, betas=(0.9, 0.95), weight_decay=0.0) for n, m in master.items()}
 total = sum(p.numel() for p in policy.parameters())
 
 
@@ -74,8 +76,10 @@ for step in range(1, STEPS + 1):
     loss = -(adv * seq_lp).mean()
     loss.backward()
     for n, p in policy.named_parameters():
-        master[n].grad = p.grad.detach().float().cpu(); p.grad = None
-    opt.step(); opt.zero_grad(set_to_none=True)
+        master[n].grad = p.grad.detach().float().cpu()
+        p.grad = None
+        opts[n].step()
+        master[n].grad = None
     with torch.no_grad():
         for n, p in policy.named_parameters():
             p.copy_(master[n].to(torch.bfloat16))
