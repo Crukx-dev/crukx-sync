@@ -1,9 +1,9 @@
 """Triton kernel for the block decoder: one lane per 256-symbol block, all blocks in parallel.
 
 Same algorithm and the same validation as codec._decode_blocks_fast (which stays the reference and
-the CPU path): two 64-bit window reads per symbol, unary run by count-leading-zeros, Rice
-remainder, canonical Huffman by code length. Corrupt input only raises flags; every load index is
-clamped.
+the CPU path): 64-bit window reads, unary run by count-leading-zeros (continued across windows for
+long runs), Rice remainder, canonical Huffman by code length. Corrupt input only raises flags;
+every load index is clamped.
 """
 
 from __future__ import annotations
@@ -45,14 +45,19 @@ def _decode_kernel(W, n_words, cur_p, end_p, count_p, base_p, rice_p, qmax_p, tb
     qmax = tl.load(qmax_p + lane, mask=live, other=0)
     tbl = tl.load(tbl_p + lane, mask=live, other=0)
     bad = tl.zeros([LANES], dtype=tl.int32)
-    longrun = tl.zeros([LANES], dtype=tl.int32)
     rice_u = rice.to(tl.uint64)
     for step in range(NSTEP):
         act = live & (step < count)
         bad = tl.where(act & (cur >= end), 1, bad)
         y = ~_read64(W, n_words, cur)
-        longrun = tl.where(act & (y == 0), 1, longrun)
         q = libdevice.clz(y.to(tl.int64)).to(tl.int64)
+        # unary runs longer than one window: keep reading windows (bounded by qmax: a run longer
+        # than the group allows is corrupt and stops here)
+        need = act & (y == 0) & (q <= qmax)
+        while tl.max(need.to(tl.int32), axis=0) > 0:
+            y = ~_read64(W, n_words, cur + q)
+            q = tl.where(need, q + libdevice.clz(y.to(tl.int64)).to(tl.int64), q)
+            need = need & (y == 0) & (q <= qmax)
         bad = tl.where(act & (q > qmax), 1, bad)
         c = cur + q + 1
         x = _read64(W, n_words, c)
@@ -79,11 +84,12 @@ def _decode_kernel(W, n_words, cur_p, end_p, count_p, base_p, rice_p, qmax_p, tb
         tl.store(zz_p + out, sym, mask=act)
         cur = tl.where(act, c + rice + L, cur)
     bad = tl.where(live & (cur != end), 1, bad)
-    tl.store(flags_p + lane, bad | (longrun << 1), mask=live)
+    tl.store(flags_p + lane, bad, mask=live)
 
 
 def decode_blocks(W: torch.Tensor, blocks, tabs, total: int):
-    """(gaps, zz, bad, long_run) like codec._decode_blocks_fast, for CUDA tensors."""
+    """(gaps, zz, bad, long_run) like codec._decode_blocks_fast, for CUDA tensors. Long unary runs
+    are decoded in the kernel, so long_run is always False here."""
     cur, blk_end, blk_count, elem_base, rice, q_max, tbl = blocks
     first, ncode, base, syms, _ = tabs
     n = cur.numel()
@@ -96,4 +102,4 @@ def decode_blocks(W: torch.Tensor, blocks, tabs, total: int):
                          first.contiguous(), ncode.contiguous(), base.contiguous(), syms.contiguous(),
                          syms.numel(), gaps, zz, flags, n,
                          NSTEP=BLOCK, MAXLEN=MAX_CODE_LEN, LANES=LANES)
-    return gaps, zz, (flags & 1).any(), ((flags >> 1) & 1).any()
+    return gaps, zz, flags.any(), torch.zeros((), dtype=torch.bool, device=W.device)

@@ -26,11 +26,12 @@ Spec: [docs/FORMAT.md](docs/FORMAT.md). Research: `crukx-research/studies/2026-1
 | bytes | 3.09 GB | 56–80 MB | **6.3–9.9 MB** (0.31–0.65 B per changed weight) |
 | exact | — | yes | yes, checksum-verified |
 
-GPU time (torch, no custom kernels, checksum caches on): **encode 0.61–0.77 s, apply 0.48–0.59 s**
-per update at 1.5B (the training step is 6.7 s). First update ~1.5 s / 1.1 s (full checksums).
-Where bandwidth binds this is already decisive: at 1 Gbit/s a 3.09 GB broadcast takes ~25 s,
-crukx-sync ~0.1 s on the wire + ~1.2 s of codec. Next: fuse the ~330 small tensors and write CUDA
-kernels for ranking and bit packing.
+Speed on real GRPO updates at 1.5B (RTX 3090, checksum caches on, steps 2–8): **encode ~0.36 s,
+apply ~0.26 s** per update (the GPU decode itself is a Triton kernel, ~6 ms; the rest is ranking
+weights by exponent). At 7B on an H100 the earlier version measured encode 2–3 s / apply 1.4–2.5 s
+at 1–2% of weights changed; the current version has not been re-measured at 7B yet.
+On identical updates crukx-sync is 2.4–3.7x smaller than NeMo RL's XOR + zstd payload and 8–14x
+smaller than raw positions + values (`CRUKX_BENCH_COMPARE=1`).
 
 ## Develop
 
