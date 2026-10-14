@@ -252,3 +252,16 @@ def test_encode_on_cpu_apply_on_gpu():
         pytest.skip("no GPU")
     a, b = rl_like_pair()
     roundtrip({"w": a}, {"w": b}, apply_device="cuda")
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+def test_long_unary_run_takes_the_exact_slow_path(dev):
+    """Many small gaps and one huge one in the same group: the Rice parameter stays small, so one
+    unary run is far longer than a 64-bit window."""
+    a = torch.full((1 << 20,), 0x3F80, dtype=torch.int16, device=dev)
+    b = a.clone()
+    b[:2000] += 1          # dense changes: gaps of 0
+    b[-1] += 1             # then one gap of ~1M
+    upd, _ = roundtrip({"w": a}, {"w": b})
+    from crukx_sync.wire import parse
+    assert parse(upd).tensors[0].groups[0].rice_r < 10  # so the long gap's unary run is >> 64 bits

@@ -415,6 +415,109 @@ def _cache_get(checksums, name, t):
     return hit[0] if isinstance(hit, tuple) and hit[1] == t._version else None
 
 
+def _lsr(v: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Logical right shift of int64 bit patterns by k in 0..64 (k = 64 gives 0)."""
+    kk = k.clamp(max=63)
+    out = (v >> kk) & ((torch.ones_like(v) << (64 - kk).clamp(max=63)) - 1 | torch.where(kk == 0, -1, 0))
+    return torch.where(k >= 64, 0, out)
+
+
+def _msb(y: torch.Tensor) -> torch.Tensor:
+    """Index of the highest set bit of y >= 1 (int64), exact: float64 frexp on <= 33-bit halves."""
+    hi = y >> 31
+    part = torch.where(hi > 0, hi, y)
+    e = torch.frexp(part.double()).exponent.long() - 1
+    return torch.where(hi > 0, e + 31, e)
+
+
+def _words64(payload: bytes, dev) -> torch.Tensor:
+    """Payload as big-endian int64 words (zero padded), for 64-bit window reads."""
+    raw = payload + bytes(-len(payload) % 8 + 16)
+    b = torch.frombuffer(bytearray(raw), dtype=torch.uint8).to(dev).long().view(-1, 8)
+    return sum(b[:, k] << (56 - 8 * k) for k in range(8))
+
+
+def _read64(W: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
+    """64 bits starting at bit `pos`, MSB first (pos clamped into the buffer)."""
+    w = (pos >> 6).clamp(0, W.numel() - 2)
+    s = pos & 63
+    return (W[w] << s) | _lsr(W[w + 1], 64 - s)
+
+
+def _decode_blocks_fast(payload, blocks, tabs, total, dev):
+    """All blocks in one vectorised loop of 256 steps, two 64-bit window reads per step."""
+    cur, blk_end, blk_count, elem_base, rice, q_max, tbl = blocks
+    first, ncode, base, syms, lens = tabs
+    W = _words64(payload, dev)
+    gaps = torch.zeros(total + 1, dtype=torch.long, device=dev)  # last slot absorbs inactive writes
+    zz = torch.zeros(total + 1, dtype=torch.long, device=dev)
+    bad = torch.zeros((), dtype=torch.bool, device=dev)
+    long_run = torch.zeros((), dtype=torch.bool, device=dev)
+    fc_all, nc_all = first[:, 1:], ncode[:, 1:]
+    for step in range(BLOCK):
+        active = step < blk_count
+        bad |= (active & (cur >= blk_end)).any()
+        y = ~_read64(W, cur)                        # leading ones of the window = unary q
+        long_run |= (active & (y == 0)).any()
+        q = torch.where(y < 0, 0, 63 - _msb(y.clamp(min=1)))
+        bad |= (active & (q > q_max)).any()
+        c = cur + q + 1
+        x = _read64(W, c)
+        rem = _lsr(x, 64 - rice)
+        codes = _lsr(x << rice, torch.full_like(rice, 64 - MAX_CODE_LEN)).unsqueeze(1) >> (MAX_CODE_LEN - lens)
+        fc, nc = fc_all[tbl], nc_all[tbl]
+        ok = (codes >= fc) & (codes < fc + nc)
+        bad |= (active & ~ok.any(1)).any()
+        L = ok.int().argmax(1) + 1
+        code = codes.gather(1, (L - 1).unsqueeze(1)).squeeze(1)
+        sym_i = base[tbl, L] + code - first[tbl, L]
+        out = torch.where(active, elem_base + step, total)
+        gaps[out] = (q << rice) | rem
+        zz[out] = syms[sym_i.clamp(0, syms.numel() - 1)]
+        cur = torch.where(active, c + rice + L, cur)
+    bad |= (cur != blk_end).any()
+    return gaps[:total], zz[:total], bad, long_run
+
+
+def _decode_blocks_slow(payload, blocks, tabs, total, dev):
+    """Exact path for any unary length: finds each run's end in the list of zero bits."""
+    cur, blk_end, blk_count, elem_base, rice, q_max, tbl = blocks
+    first, ncode, base, syms, lens = tabs
+    buf = torch.frombuffer(bytearray(payload + bytes(16)), dtype=torch.uint8).to(dev)
+    bits = (buf.unsqueeze(1) >> torch.arange(7, -1, -1, dtype=torch.uint8, device=dev)) & 1
+    idx_t = torch.int32 if bits.numel() < 1 << 31 else torch.long
+    zeros = torch.nonzero(bits.flatten() == 0).flatten().to(idx_t)
+    del bits
+    gaps = torch.zeros(total + 1, dtype=torch.long, device=dev)
+    zz = torch.zeros(total + 1, dtype=torch.long, device=dev)
+    peek_n = torch.full_like(cur, MAX_CODE_LEN)
+    bad = torch.zeros((), dtype=torch.bool, device=dev)
+    for step in range(BLOCK):
+        active = step < blk_count
+        bad |= (active & (cur >= blk_end)).any()
+        k = torch.searchsorted(zeros, cur.to(idx_t))
+        bad |= (active & (k >= zeros.numel())).any()
+        nxt = zeros[k.clamp(max=zeros.numel() - 1)].long()
+        q = nxt - cur
+        bad |= (active & (q > q_max)).any()
+        c = nxt + 1
+        rem = _read_bits(buf, c, rice)
+        c = c + rice
+        codes = _read_bits(buf, c, peek_n).unsqueeze(1) >> (MAX_CODE_LEN - lens)
+        fc, nc = first[tbl, 1:], ncode[tbl, 1:]
+        ok = (codes >= fc) & (codes < fc + nc)
+        bad |= (active & ~ok.any(1)).any()
+        L = ok.int().argmax(1) + 1
+        code = codes.gather(1, (L - 1).unsqueeze(1)).squeeze(1)
+        sym_i = base[tbl, L] + code - first[tbl, L]
+        out = torch.where(active, elem_base + step, total)
+        gaps[out] = (q.clamp(0, 1 << 32) << rice) | rem
+        zz[out] = syms[sym_i.clamp(0, syms.numel() - 1)]
+        cur = torch.where(active, c + L, cur)
+    bad |= (cur != blk_end).any()
+    return gaps[:total], zz[:total], bad
+
+
 def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict | None = None) -> int:
     """Verify `u` against `weights`, then write the new values in place. Returns elements changed."""
     if not u.tensors:
@@ -461,40 +564,13 @@ def apply(weights: Mapping[str, torch.Tensor], u: Update, checksums: dict | None
     first, ncode, base, syms = _canonical_tables(u.tables, dev)
     lens = torch.arange(1, MAX_CODE_LEN + 1, device=dev)
 
-    buf = torch.frombuffer(bytearray(u.payload + bytes(16)), dtype=torch.uint8).to(dev)
-    bits = (buf.unsqueeze(1) >> torch.arange(7, -1, -1, dtype=torch.uint8, device=dev)) & 1
-    idx_t = torch.int32 if bits.numel() < 1 << 31 else torch.long
-    zeros = torch.nonzero(bits.flatten() == 0).flatten().to(idx_t)
-    del bits
     total = int(counts.sum())
-    gaps = torch.zeros(total + 1, dtype=torch.long, device=dev)  # last slot absorbs inactive writes
-    zz = torch.zeros(total + 1, dtype=torch.long, device=dev)
-    peek_n = torch.full_like(cur, MAX_CODE_LEN)
-    bad = torch.zeros((), dtype=torch.bool, device=dev)
-    for step in range(BLOCK):
-        active = step < blk_count
-        bad |= (active & (cur >= blk_end)).any()
-        k = torch.searchsorted(zeros, cur.to(idx_t))
-        bad |= (active & (k >= zeros.numel())).any()
-        nxt = zeros[k.clamp(max=zeros.numel() - 1)].long()
-        q = nxt - cur
-        bad |= (active & (q > q_max)).any()
-        c = nxt + 1
-        rem = _read_bits(buf, c, rice)
-        c = c + rice
-        # canonical decode: the shortest length whose code range contains the prefix
-        codes = _read_bits(buf, c, peek_n).unsqueeze(1) >> (MAX_CODE_LEN - lens)
-        fc, nc = first[tbl, 1:], ncode[tbl, 1:]
-        ok = (codes >= fc) & (codes < fc + nc)
-        bad |= (active & ~ok.any(1)).any()
-        L = ok.int().argmax(1) + 1
-        code = codes.gather(1, (L - 1).unsqueeze(1)).squeeze(1)
-        sym_i = base[tbl, L] + code - first[tbl, L]
-        out = torch.where(active, elem_base + step, total)
-        gaps[out] = (q.clamp(0, 1 << 32) << rice) | rem
-        zz[out] = syms[sym_i.clamp(0, syms.numel() - 1)]
-        cur = torch.where(active, c + L, cur)
-    bad |= (cur != blk_end).any()
+    blocks = (cur, blk_end, blk_count, elem_base, rice, q_max, tbl)
+    tabs = (first, ncode, base, syms, lens)
+    gaps, zz, bad_dec, long_run = _decode_blocks_fast(u.payload, blocks, tabs, total, dev)
+    if bool(long_run):  # a unary run longer than one 64-bit window: exact slow path
+        gaps, zz, bad_dec = _decode_blocks_slow(u.payload, blocks, tabs, total, dev)
+    bad = bad_dec
 
     # per tensor: positions, new values, checksum delta. Validation flags and checksums are
     # gathered as tensors and checked once at the end; nothing is written until all pass.
