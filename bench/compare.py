@@ -13,9 +13,15 @@ ambiguous we pick the choice most favourable to that format, as noted per functi
              positions as gaps at their ideal order-0 entropy + XOR values at ideal order-0 entropy.
 - sparserl:  SparseRL-Sync: 16-bit position deltas (32-bit where a gap does not fit) + bf16 values
              entropy-coded; values counted at their ideal order-0 entropy (a lower bound for them).
+- arcv3:     Fireworks ARCv3, their own code (`fireworks-delta-compression`, MIT), only when importable.
+             All its candidates are allowed to finish (it normally keeps the best of those done by 1.5x
+             the first one's time), every tensor's roundtrip is checked, unchanged tensors cost 0.
 """
 
+
 from __future__ import annotations
+import os
+os.environ.setdefault("ARC3_CANDIDATE_WAIT_MULTIPLIER", "1000")  # read at import: let every candidate finish
 
 import numpy as np
 import torch
@@ -28,6 +34,23 @@ def _width(deltas: np.ndarray) -> np.ndarray:
         if m <= np.iinfo(dt).max:
             return deltas.astype(dt)
     raise AssertionError
+
+
+def _arcv3(old, new):
+    try:
+        import fireworks_delta_compression as fdc
+    except ImportError:
+        return None
+    total = 0
+    for name in old:
+        a, b = old[name].detach().cpu(), new[name].detach().cpu()
+        if torch.equal(a.view(torch.int16), b.view(torch.int16)):
+            continue
+        diff, chk = fdc.delta_compress(src=a, dst=b, compression_format="arc_v3")
+        back = fdc.delta_decompress(src=a, compressed_diff=diff, checksum=chk, compression_format="arc_v3")
+        assert torch.equal(back.view(torch.int16), b.view(torch.int16)), f"arc_v3 not exact on {name}"
+        total += diff.numel() + len(str(chk))
+    return total
 
 
 def sizes(old: dict[str, torch.Tensor], new: dict[str, torch.Tensor]) -> dict[str, int]:
@@ -71,4 +94,7 @@ def sizes(old: dict[str, torch.Tensor], new: dict[str, torch.Tensor]) -> dict[st
     cls = np.where(gaps > 0, np.floor(np.log2(np.maximum(gaps, 1))).astype(np.int64) + 1, 0)
     gap_bytes = h(cls) + int(np.maximum(cls - 1, 0).sum() // 8)  # bit-length class + raw mantissa
     ctxfree = gap_bytes + h(np.concatenate(all_xor))
-    return {"raw": raw, "nemo": nemo, "pulse": pulse, "sparserl": sparserl, "ctxfree": ctxfree}
+    out = {"raw": raw, "nemo": nemo, "pulse": pulse, "sparserl": sparserl, "ctxfree": ctxfree}
+    if (arc := _arcv3(old, new)) is not None:
+        out["arcv3"] = arc
+    return out

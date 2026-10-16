@@ -353,7 +353,7 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
 
     # per batch: Rice parameters and residual symbol counts
     dense = torch.zeros(256 * _SMALL, dtype=torch.long, device=dev)
-    rare = []
+    rare_k, rare_c = [], []
     for bt in batches:
         cnt = bt["g_cnt"]
         bt["gid"] = torch.repeat_interleave(torch.arange(cnt.numel(), device=dev), cnt)
@@ -361,17 +361,20 @@ def encode(old: Mapping[str, torch.Tensor], new: Mapping[str, torch.Tensor],
         ex, zz = bt["ex"].long(), bt["zz"].long()
         small = zz < _SMALL
         dense += torch.bincount(ex[small] * _SMALL + zz[small], minlength=256 * _SMALL)
-        rare.append(ex[~small] * _SYM_SPACE + zz[~small])
+        # rare symbols are counted per batch: dense deltas (full fine-tunes) have ~1 per change
+        rk, rc = torch.unique(ex[~small] * _SYM_SPACE + zz[~small], return_counts=True)
+        rare_k.append(rk)
+        rare_c.append(rc)
 
     # pass 2: one Huffman table per exponent for the whole update
     nz = torch.nonzero(dense).flatten()
     keys = (nz // _SMALL) * _SYM_SPACE + nz % _SMALL
     kcount = dense[nz]
-    rare = torch.cat(rare)
-    if rare.numel():
-        rk, rc = torch.unique(rare, return_counts=True)
+    rk, inv = torch.unique(torch.cat(rare_k), return_inverse=True)
+    if rk.numel():
+        rc = torch.zeros_like(rk).scatter_add_(0, inv, torch.cat(rare_c))
         keys, kcount = torch.cat([keys, rk]), torch.cat([kcount, rc])
-    del rare
+    del rare_k, rare_c
     srt = torch.argsort(keys)
     keys_t = keys[srt]
     keys, kcount = keys_t.tolist(), kcount[srt].tolist()
